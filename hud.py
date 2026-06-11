@@ -120,12 +120,12 @@ WS_PORT = 17890   # 权限请求/响应（需要双向应答）
 UDP_PORT = 17891  # 状态上报（fire-and-forget，hook 端零依赖）
 
 STATUS_COLORS = {
-    "idle":               QColor(120, 120, 120),
-    "working":            QColor(52, 199, 89),
-    "waiting":            QColor(255, 204, 0),
-    "waiting_permission": QColor(255, 149, 0),
-    "error":              QColor(255, 59, 48),
-    "done":               QColor(52, 199, 89),
+    "idle":               QColor(90, 90, 110),     # 蓝灰 #5A5A6E
+    "working":            QColor(0, 229, 160),     # 荧光青绿 #00E5A0
+    "waiting":            QColor(255, 234, 0),     # 明艳黄 #FFEA00
+    "waiting_permission": QColor(255, 159, 10),    # 亮橙 #FF9F0A
+    "error":              QColor(255, 77, 109),    # 霓虹粉红 #FF4D6D
+    "done":               QColor(0, 229, 160),
 }
 
 TOOL_LABELS = {
@@ -404,21 +404,21 @@ class SessionTab(QFrame):
         self.dot.setFixedWidth(14)
         self.dot.setStyleSheet("font-size: 10px;")
         self.name_label = QLabel("...")
-        self.name_label.setStyleSheet("color: #ccc; font-size: 11px; font-weight: bold;")
+        self.name_label.setStyleSheet("color: #D8D8E8; font-size: 11px; font-weight: bold;")
         self.name_label.setMaximumWidth(self.TAB_W - 36)
         top.addWidget(self.dot)
         top.addWidget(self.name_label, 1)
 
         self.action_label = QLabel("")
-        self.action_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.action_label.setStyleSheet("color: #9A9AB0; font-size: 11px;")
 
         bottom_row = QHBoxLayout()
         bottom_row.setSpacing(0)
         self.detail_label = QLabel("")
-        self.detail_label.setStyleSheet("color: #666; font-size: 10px;")
+        self.detail_label.setStyleSheet("color: #6A6A80; font-size: 10px;")
         self.detail_label.setMaximumWidth(self.TAB_W - 50)
         self.elapsed_label = QLabel("")
-        self.elapsed_label.setStyleSheet("color: #444; font-size: 10px;")
+        self.elapsed_label.setStyleSheet("color: #5C5C78; font-size: 10px;")
         self.elapsed_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         bottom_row.addWidget(self.detail_label, 1)
         bottom_row.addWidget(self.elapsed_label)
@@ -435,10 +435,10 @@ class SessionTab(QFrame):
         if active:
             self.setStyleSheet("""
                 QFrame {
-                    background: rgba(50,50,55,240);
-                    border-top: 2px solid #34c759;
-                    border-left: 1px solid rgba(255,255,255,0.15);
-                    border-right: 1px solid rgba(255,255,255,0.08);
+                    background: rgba(32,32,50,245);
+                    border-top: 2px solid #00E5A0;
+                    border-left: 1px solid rgba(200,200,255,0.14);
+                    border-right: 1px solid rgba(200,200,255,0.07);
                     border-bottom: none;
                     border-radius: 0px;
                 }
@@ -446,10 +446,10 @@ class SessionTab(QFrame):
         else:
             self.setStyleSheet("""
                 QFrame {
-                    background: rgba(28,28,30,180);
-                    border-top: 2px solid rgba(255,255,255,0.08);
-                    border-left: 1px solid rgba(255,255,255,0.06);
-                    border-right: 1px solid rgba(255,255,255,0.04);
+                    background: rgba(22,22,30,185);
+                    border-top: 2px solid rgba(200,200,255,0.08);
+                    border-left: 1px solid rgba(200,200,255,0.06);
+                    border-right: 1px solid rgba(200,200,255,0.04);
                     border-bottom: none;
                     border-radius: 0px;
                 }
@@ -491,10 +491,10 @@ class SessionTab(QFrame):
             self._set_style(active=is_active)
         if status == "waiting_permission":
             self.action_label.setText("需要确认")
-            self.action_label.setStyleSheet("color: #ff9500; font-size: 11px; font-weight: bold;")
+            self.action_label.setStyleSheet("color: #FF9F0A; font-size: 11px; font-weight: bold;")
             self.detail_label.setText("弹窗等待操作")
         else:
-            self.action_label.setStyleSheet("color: #aaa; font-size: 11px;")
+            self.action_label.setStyleSheet("color: #9A9AB0; font-size: 11px;")
 
     def refresh_elapsed(self):
         if self._start_ts:
@@ -535,9 +535,9 @@ class PermissionDialog(QDialog):
         card = QFrame()
         card.setStyleSheet("""
             QFrame {
-                background: rgba(28,28,30,248);
+                background: rgba(22,22,30,250);
                 border-radius: 14px;
-                border: 1px solid rgba(255,149,0,0.4);
+                border: 1px solid rgba(255,159,10,0.5);
             }
         """)
         layout = QVBoxLayout(card)
@@ -547,9 +547,9 @@ class PermissionDialog(QDialog):
         # 标题 + 倒计时
         title_row = QHBoxLayout()
         title = QLabel("需要授权")
-        title.setStyleSheet("color: #ff9500; font-size: 14px; font-weight: bold;")
+        title.setStyleSheet("color: #FF9F0A; font-size: 14px; font-weight: bold;")
         self._timer_label = QLabel(f"{self.TIMEOUT}s")
-        self._timer_label.setStyleSheet("color: #666; font-size: 12px;")
+        self._timer_label.setStyleSheet("color: #6A6A80; font-size: 12px;")
         title_row.addWidget(title)
         title_row.addStretch()
         title_row.addWidget(self._timer_label)
@@ -561,7 +561,7 @@ class PermissionDialog(QDialog):
         cwd_short = cwd.replace("\\", "/").rstrip("/").split("/")[-1] if cwd else ""
         info_text = f"{TOOL_LABELS.get(tool, tool)}  ·  {cwd_short or sid_short}"
         info = QLabel(info_text)
-        info.setStyleSheet("color: #888; font-size: 11px;")
+        info.setStyleSheet("color: #9A9AB0; font-size: 11px;")
 
         # 命令详情：展示完整内容（可滚动），授权前必须能看到全部命令
         detail = full_tool_input(tool, data.get("tool_input", {}))
@@ -573,7 +573,7 @@ class PermissionDialog(QDialog):
         detail_box.setLineWrapMode(QTextEdit.WidgetWidth)
         detail_box.setStyleSheet("""
             QTextEdit {
-                background: rgba(255,255,255,0.05); color: #eee;
+                background: rgba(110,91,255,0.10); color: #E8E8F0;
                 border-radius: 6px; border: none; font-size: 11px; padding: 4px;
                 font-family: Consolas, monospace;
             }
@@ -589,24 +589,24 @@ class PermissionDialog(QDialog):
             btn.setFixedHeight(32)
             btn.setCursor(Qt.PointingHandCursor)
         btn_deny.setStyleSheet("""
-            QPushButton { background: rgba(255,59,48,0.15); color: #ff453a;
-                border-radius: 7px; border: 1px solid rgba(255,59,48,0.35); font-size: 12px; }
-            QPushButton:hover { background: rgba(255,59,48,0.3); }
+            QPushButton { background: rgba(255,77,109,0.15); color: #FF4D6D;
+                border-radius: 7px; border: 1px solid rgba(255,77,109,0.4); font-size: 12px; }
+            QPushButton:hover { background: rgba(255,77,109,0.32); }
         """)
         btn_terminal.setStyleSheet("""
-            QPushButton { background: rgba(255,255,255,0.08); color: #aaa;
-                border-radius: 7px; border: 1px solid rgba(255,255,255,0.2); font-size: 12px; }
-            QPushButton:hover { background: rgba(255,255,255,0.18); }
+            QPushButton { background: rgba(140,140,180,0.12); color: #9A9AB0;
+                border-radius: 7px; border: 1px solid rgba(140,140,180,0.32); font-size: 12px; }
+            QPushButton:hover { background: rgba(140,140,180,0.26); }
         """)
         btn_allow.setStyleSheet("""
-            QPushButton { background: rgba(52,199,89,0.15); color: #34c759;
-                border-radius: 7px; border: 1px solid rgba(52,199,89,0.35); font-size: 12px; }
-            QPushButton:hover { background: rgba(52,199,89,0.3); }
+            QPushButton { background: rgba(0,229,160,0.13); color: #00E5A0;
+                border-radius: 7px; border: 1px solid rgba(0,229,160,0.4); font-size: 12px; }
+            QPushButton:hover { background: rgba(0,229,160,0.3); }
         """)
         btn_always_allow.setStyleSheet("""
-            QPushButton { background: rgba(10,132,255,0.15); color: #0a84ff;
-                border-radius: 7px; border: 1px solid rgba(10,132,255,0.35); font-size: 12px; }
-            QPushButton:hover { background: rgba(10,132,255,0.3); }
+            QPushButton { background: rgba(110,91,255,0.15); color: #6E5BFF;
+                border-radius: 7px; border: 1px solid rgba(110,91,255,0.4); font-size: 12px; }
+            QPushButton:hover { background: rgba(110,91,255,0.32); }
         """)
         btn_deny.clicked.connect(self._deny)
         btn_terminal.clicked.connect(self._to_terminal)
@@ -703,9 +703,9 @@ class ReminderDialog(QDialog):
         card.setCursor(Qt.PointingHandCursor)
         card.setStyleSheet("""
             QFrame {
-                background: rgba(28,28,30,248);
+                background: rgba(22,22,30,250);
                 border-radius: 14px;
-                border: 1px solid rgba(10,132,255,0.55);
+                border: 1px solid rgba(94,158,255,0.55);
             }
         """)
         layout = QVBoxLayout(card)
@@ -715,9 +715,9 @@ class ReminderDialog(QDialog):
         title_row = QHBoxLayout()
         self._title_label = QLabel(self._title_for(data.get("message", "")))
         self._title_label.setStyleSheet(
-            "color: #0a84ff; font-size: 14px; font-weight: bold;")
+            "color: #5E9EFF; font-size: 14px; font-weight: bold;")
         hint = QLabel("点击关闭")
-        hint.setStyleSheet("color: #666; font-size: 11px;")
+        hint.setStyleSheet("color: #6A6A80; font-size: 11px;")
         title_row.addWidget(self._title_label)
         title_row.addStretch()
         title_row.addWidget(hint)
@@ -726,11 +726,11 @@ class ReminderDialog(QDialog):
         cwd_short = cwd.replace("\\", "/").rstrip("/").split("/")[-1] if cwd else ""
         sid_short = self.session_id[:8]
         info = QLabel(f"会话 {cwd_short or sid_short}")
-        info.setStyleSheet("color: #888; font-size: 11px;")
+        info.setStyleSheet("color: #9A9AB0; font-size: 11px;")
 
         self._msg_label = QLabel(data.get("message", "") or "Claude Code 在终端里等待你的确认")
         self._msg_label.setWordWrap(True)
-        self._msg_label.setStyleSheet("color: #eee; font-size: 12px;")
+        self._msg_label.setStyleSheet("color: #E8E8F0; font-size: 12px;")
 
         layout.addLayout(title_row)
         layout.addWidget(info)
@@ -786,7 +786,7 @@ class SessionDetailDialog(QDialog):
         box = QTextEdit()
         box.setReadOnly(True)
         box.setStyleSheet(
-            "QTextEdit { background: #1c1c1e; color: #ddd; border: none;"
+            "QTextEdit { background: #16161E; color: #D8D8E8; border: none;"
             " font-family: Consolas, monospace; font-size: 12px; }")
         lines = [
             f"会话: {session_id}",
@@ -825,7 +825,7 @@ class HistoryDialog(QDialog):
         box = QTextEdit()
         box.setReadOnly(True)
         box.setStyleSheet(
-            "QTextEdit { background: #1c1c1e; color: #ddd; border: none;"
+            "QTextEdit { background: #16161E; color: #D8D8E8; border: none;"
             " font-family: Consolas, monospace; font-size: 12px; }")
         try:
             with open(HISTORY_FILE, encoding="utf-8") as f:
@@ -886,10 +886,10 @@ class SessionPanel(QWidget):
         self._tab_bar = QWidget()
         self._tab_bar.setStyleSheet("""
             QWidget {
-                background: rgba(20,20,22,230);
+                background: rgba(16,16,26,235);
                 border-radius: 10px 10px 0px 0px;
-                border: 1px solid rgba(255,255,255,0.10);
-                border-bottom: 2px solid rgba(255,255,255,0.08);
+                border: 1px solid rgba(200,200,255,0.10);
+                border-bottom: 2px solid rgba(0,229,160,0.30);
             }
         """)
         self._tabs_layout = QHBoxLayout(self._tab_bar)
@@ -900,7 +900,7 @@ class SessionPanel(QWidget):
         # 无 session 时的占位
         self._empty_label = QLabel("暂无活动 Session")
         self._empty_label.setFixedSize(self.EMPTY_W, self.PANEL_H)
-        self._empty_label.setStyleSheet("color: #555; font-size: 12px;")
+        self._empty_label.setStyleSheet("color: #5C5C78; font-size: 12px;")
         self._empty_label.setAlignment(Qt.AlignCenter)
         self._tabs_layout.insertWidget(0, self._empty_label)
 
@@ -975,12 +975,150 @@ class SessionPanel(QWidget):
         self._ball._schedule_hide()
 
 
+class SlingOverlay(QWidget):
+    """弹弓覆盖层：全虚拟桌面透明窗口（鼠标穿透），画拉弓皮筋和飞行中的会话点。
+    皮筋会拉出悬浮球窗口范围，必须在独立覆盖层上画；物理循环 16ms 一帧。"""
+    GRAVITY = 2400.0      # px/s^2
+    DAMPING = 0.62        # 边缘反弹速度保留比例
+    FLY_SECONDS = 2.4     # 自由飞行时长，之后飞回悬浮球归位
+    DOT_R = 7.0
+
+    def __init__(self):
+        super().__init__(None)
+        self.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+            | Qt.WindowTransparentForInput
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self._pull = None    # {"anchor": QPointF, "cur": QPointF, "color": QColor}
+        self._dots = []      # 飞行中: {sid,pos,vel,color,t,phase,home_fn,done_fn}
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+
+    def _ensure_geometry(self):
+        self.setGeometry(QApplication.primaryScreen().virtualGeometry())
+
+    def set_pull(self, anchor: QPointF, cur: QPointF, color: QColor):
+        self._ensure_geometry()
+        self._pull = {"anchor": anchor, "cur": cur, "color": color}
+        if not self.isVisible():
+            self.show()
+        self.update()
+
+    def clear_pull(self):
+        self._pull = None
+        self.update()
+
+    def add_dot(self, sid: str, pos: QPointF, vel: QPointF, color: QColor,
+                home_fn, done_fn):
+        self._ensure_geometry()
+        self._dots.append({"sid": sid, "pos": pos, "vel": vel, "color": color,
+                           "t": 0.0, "phase": "fly", "trail": [],
+                           "home_fn": home_fn, "done_fn": done_fn})
+        if not self.isVisible():
+            self.show()
+        if not self._timer.isActive():
+            self._timer.start(16)
+
+    def maybe_hide(self):
+        if self._pull is None and not self._dots:
+            self._timer.stop()
+            self.hide()
+
+    def _tick(self):
+        dt = 0.016
+        geo = self.geometry()
+        finished = []
+        for d in self._dots:
+            if d["phase"] == "fly":
+                d["t"] += dt
+                d["vel"].setY(d["vel"].y() + self.GRAVITY * dt)
+                d["pos"] = d["pos"] + d["vel"] * dt
+                r = self.DOT_R
+                if d["pos"].x() < geo.left() + r:
+                    d["pos"].setX(geo.left() + r)
+                    d["vel"].setX(-d["vel"].x() * self.DAMPING)
+                elif d["pos"].x() > geo.right() - r:
+                    d["pos"].setX(geo.right() - r)
+                    d["vel"].setX(-d["vel"].x() * self.DAMPING)
+                if d["pos"].y() < geo.top() + r:
+                    d["pos"].setY(geo.top() + r)
+                    d["vel"].setY(-d["vel"].y() * self.DAMPING)
+                elif d["pos"].y() > geo.bottom() - r:
+                    d["pos"].setY(geo.bottom() - r)
+                    d["vel"].setY(-d["vel"].y() * self.DAMPING)
+                    d["vel"].setX(d["vel"].x() * 0.985)  # 贴地摩擦
+                if d["t"] >= self.FLY_SECONDS:
+                    d["phase"] = "return"
+            else:  # return: 缓动飞回悬浮球上的家
+                home = d["home_fn"]()
+                if home is None:        # 会话已结束，点直接消失
+                    finished.append(d)
+                    continue
+                delta = home - d["pos"]
+                if math.hypot(delta.x(), delta.y()) < 5:
+                    finished.append(d)
+                    continue
+                d["pos"] = d["pos"] + delta * 0.22
+        for d in self._dots:
+            # 拖尾：存副本（bounce 分支会原地 setX/setY 改 pos 对象）
+            d["trail"].append(QPointF(d["pos"]))
+            if len(d["trail"]) > 7:
+                d["trail"].pop(0)
+        for d in finished:
+            self._dots.remove(d)
+            try:
+                d["done_fn"](d["sid"])
+            except Exception:
+                logger.exception("弹弓归位回调失败")
+        self.update()
+        self.maybe_hide()
+
+    def _draw_dot(self, p: QPainter, pos: QPointF, color: QColor):
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(color))
+        p.drawEllipse(pos, self.DOT_R, self.DOT_R)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        off = QPointF(self.geometry().topLeft())
+        if self._pull:
+            a = self._pull["anchor"] - off
+            c = self._pull["cur"] - off
+            dx, dy = c.x() - a.x(), c.y() - a.y()
+            dist = math.hypot(dx, dy) or 1.0
+            # 叉臂锚点：垂直于拉伸方向两侧偏移
+            px, py = -dy / dist * 8, dx / dist * 8
+            p.setPen(QPen(QColor(0, 229, 160, 190), 2.2,
+                          Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(QPointF(a.x() + px, a.y() + py), c)
+            p.drawLine(QPointF(a.x() - px, a.y() - py), c)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(QColor(110, 91, 255, 230)))
+            p.drawEllipse(QPointF(a.x() + px, a.y() + py), 2.5, 2.5)
+            p.drawEllipse(QPointF(a.x() - px, a.y() - py), 2.5, 2.5)
+            self._draw_dot(p, c, self._pull["color"])
+        for d in self._dots:
+            trail = d["trail"]
+            n = len(trail)
+            for i, tp in enumerate(trail):
+                c = QColor(d["color"])
+                c.setAlpha(int(60 * (i + 1) / n))
+                rr = self.DOT_R * (0.25 + 0.55 * (i + 1) / n)
+                p.setPen(Qt.NoPen)
+                p.setBrush(QBrush(c))
+                p.drawEllipse(tp - off, rr, rr)
+            self._draw_dot(p, d["pos"] - off, d["color"])
+
+
 class FloatingBall(QWidget):
     BALL_SIZE = 14
     BALL_GAP = 6
     PADDING = 10
     ICON_SIZE = 16
-    ICON_COLOR = QColor(217, 119, 87)  # Claude 品牌橙
+    ICON_COLOR = QColor(255, 159, 10)  # 霓虹亮橙（赛博主题，原 Claude 品牌橙 217,119,87）
 
     def __init__(self):
         super().__init__(None)
@@ -995,6 +1133,10 @@ class FloatingBall(QWidget):
 
         self._drag_pos = None
         self._press_global = None
+        self._press_element: str | None = None
+        self._sling: dict | None = None          # 拉弓中: {sid, anchor, color}
+        self._flying_hidden: set[str] = set()    # 在外面飞的点（球上画空位圈）
+        self._sling_overlay: SlingOverlay | None = None
         self._blink_state = False
         self._hover_element: str | None = None
         self._icon_angle = 0
@@ -1110,6 +1252,12 @@ class FloatingBall(QWidget):
         y = (self.height() - self.BALL_SIZE) // 2
         for i, sid in enumerate(sids):
             x = self._dots_x0() + i * (self.BALL_SIZE + self.BALL_GAP)
+            if sid in self._flying_hidden:
+                # 点被弹弓打出去了，画个空位圈等它飞回来
+                painter.setPen(QPen(QColor(0, 229, 160, 90), 1.2))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawEllipse(x, y, self.BALL_SIZE, self.BALL_SIZE)
+                continue
             state = sessions.get(sid, {})
             status = state.get("status", "idle") if sid != "__placeholder__" else "idle"
             color = STATUS_COLORS.get(status, STATUS_COLORS["idle"])
@@ -1131,7 +1279,8 @@ class FloatingBall(QWidget):
 
     def enterEvent(self, event):
         self._cancel_hide()
-        self._apply_hover(self._element_at(event.pos()))
+        if self._sling is None:
+            self._apply_hover(self._element_at(event.pos()))
 
     def leaveEvent(self, event):
         self._hover_element = None
@@ -1141,10 +1290,18 @@ class FloatingBall(QWidget):
         if event.button() == Qt.LeftButton:
             self._drag_pos = event.globalPos() - self.frameGeometry().topLeft()
             self._press_global = event.globalPos()
+            self._press_element = self._element_at(event.pos())
 
     def mouseMoveEvent(self, event):
         if self._drag_pos and event.buttons() == Qt.LeftButton:
-            self.move(event.globalPos() - self._drag_pos)
+            elem = self._press_element
+            if elem and elem != "__icon__" and elem in sessions:
+                # 会话点不拖窗口：拖出阈值进入弹弓模式
+                if (event.globalPos() - self._press_global).manhattanLength() >= 6:
+                    self._update_sling(elem, event.globalPos())
+            else:
+                # 只有 Claude 图标（及空白区）拖动窗口
+                self.move(event.globalPos() - self._drag_pos)
         elif not event.buttons():
             self._apply_hover(self._element_at(event.pos()))
             if self._panel.isVisible():
@@ -1152,14 +1309,75 @@ class FloatingBall(QWidget):
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
+            sling = self._sling
+            self._sling = None
             is_click = (self._press_global is not None
                         and (event.globalPos() - self._press_global).manhattanLength() < 6)
             self._drag_pos = None
             self._press_global = None
+            self._press_element = None
+            if sling is not None:
+                self._launch_sling(sling, event.globalPos())
+                return
             if is_click:
                 element = self._element_at(event.pos())
                 if element != "__icon__" and element in sessions:
                     self._focus_terminal(element)
+
+    # ---------- 弹弓（拖会话点打着玩，会话本身不受影响） ----------
+
+    def _overlay(self) -> SlingOverlay:
+        if self._sling_overlay is None:
+            self._sling_overlay = SlingOverlay()
+        return self._sling_overlay
+
+    def _dot_center_global(self, sid: str) -> QPointF | None:
+        sids = list(sessions.keys())
+        if sid not in sids:
+            return None
+        i = sids.index(sid)
+        x = self._dots_x0() + i * (self.BALL_SIZE + self.BALL_GAP) + self.BALL_SIZE / 2
+        y = self.height() / 2
+        return QPointF(self.mapToGlobal(QPoint(int(x), int(y))))
+
+    def _dot_color(self, sid: str) -> QColor:
+        status = sessions.get(sid, {}).get("status", "idle")
+        return QColor(STATUS_COLORS.get(status, STATUS_COLORS["idle"]))
+
+    def _update_sling(self, sid: str, gpos):
+        if self._sling is None:
+            anchor = self._dot_center_global(sid)
+            if anchor is None:
+                return
+            self._sling = {"sid": sid, "anchor": anchor,
+                           "color": self._dot_color(sid)}
+            self._flying_hidden.add(sid)   # 点已被拉到皮筋上，球上画空位
+            self._panel.hide()             # 拉弓时收起面板防遮挡
+            self.update()
+        self._overlay().set_pull(self._sling["anchor"], QPointF(gpos),
+                                 self._sling["color"])
+
+    def _launch_sling(self, sling: dict, gpos):
+        ov = self._overlay()
+        ov.clear_pull()
+        sid = sling["sid"]
+        pull = sling["anchor"] - QPointF(gpos)
+        dist = math.hypot(pull.x(), pull.y())
+        if dist < 15:
+            # 拉伸太短视为误拖，直接归位
+            self._flying_hidden.discard(sid)
+            ov.maybe_hide()
+            self.update()
+            return
+        speed = min(dist * 9.0, 3200.0)
+        vel = QPointF(pull.x() / dist * speed, pull.y() / dist * speed)
+        ov.add_dot(sid, QPointF(gpos), vel, sling["color"],
+                   home_fn=lambda s=sid: self._dot_center_global(s),
+                   done_fn=self._sling_done)
+
+    def _sling_done(self, sid: str):
+        self._flying_hidden.discard(sid)
+        self.update()
 
     def _focus_terminal(self, sid: str):
         """点击会话点 → 聚焦其终端窗口；仅当确认窗口已关才移除该点"""
@@ -1219,10 +1437,10 @@ class FloatingBall(QWidget):
     def contextMenuEvent(self, event):
         menu = QMenu(self)
         menu.setStyleSheet("""
-            QMenu { background: #2c2c2e; color: #ddd; border: 1px solid rgba(255,255,255,0.15);
+            QMenu { background: #1E1E2A; color: #D8D8E8; border: 1px solid rgba(200,200,255,0.15);
                     border-radius: 6px; padding: 4px; font-size: 12px; }
             QMenu::item { padding: 5px 24px; border-radius: 4px; }
-            QMenu::item:selected { background: rgba(10,132,255,0.35); }
+            QMenu::item:selected { background: rgba(110,91,255,0.45); }
         """)
         act_history = QAction("查看历史", menu)
         act_quit = QAction("退出 HUD", menu)
