@@ -1,0 +1,12 @@
+# 运行时数据（含本机命令、路径等隐私，严禁提交）
+sessions.json
+history.json
+logs/
+
+# Python
+__pycache__/
+*.pyc
+
+# 临时文件
+*.tmp
+*.lock
