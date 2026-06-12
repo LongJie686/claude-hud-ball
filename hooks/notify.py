@@ -10,6 +10,8 @@ import os
 from datetime import datetime
 from typing import Any
 
+from hud_utils import hud_alive, launch_hud, acquire_file_lock, release_file_lock
+
 HUD_WS_PORT = 17890
 STATE_FILE = os.path.join(os.path.dirname(__file__), "..", "sessions.json")
 STATE_FILE = os.path.normpath(STATE_FILE)
@@ -54,19 +56,28 @@ def _write_state(state: dict[str, Any]) -> None:
 
 def update_session(session_id: str, data: dict[str, Any]) -> None:
     import time
-    state = _read_state()
-    existing = state.get(session_id, {})
-    existing.update(data)
-    existing["last_update"] = datetime.now().strftime("%H:%M:%S")
-    existing["last_update_ts"] = time.time()
-    state[session_id] = existing
-    _write_state(state)
+    # 多会话并发 hook 同时读改写 sessions.json 会互相覆盖，加文件锁
+    fd, lock = acquire_file_lock(STATE_FILE)
+    try:
+        state = _read_state()
+        existing = state.get(session_id, {})
+        existing.update(data)
+        existing["last_update"] = datetime.now().strftime("%H:%M:%S")
+        existing["last_update_ts"] = time.time()
+        state[session_id] = existing
+        _write_state(state)
+    finally:
+        release_file_lock(fd, lock)
 
 
 def remove_session(session_id: str) -> None:
-    state = _read_state()
-    state.pop(session_id, None)
-    _write_state(state)
+    fd, lock = acquire_file_lock(STATE_FILE)
+    try:
+        state = _read_state()
+        state.pop(session_id, None)
+        _write_state(state)
+    finally:
+        release_file_lock(fd, lock)
 
 
 # ---------- HUD 通信 ----------
@@ -74,29 +85,6 @@ def remove_session(session_id: str) -> None:
 # HUD 存活探测复用 WS 的 TCP 端口
 
 HUD_UDP_PORT = 17891
-
-
-def _launch_hud() -> None:
-    import subprocess
-    import time
-    script = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "hud.py"))
-    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-    exe = pythonw if os.path.exists(pythonw) else sys.executable
-    subprocess.Popen(
-        [exe, script],
-        creationflags=subprocess.CREATE_NO_WINDOW,
-        close_fds=True,
-    )
-    time.sleep(1.5)
-
-
-def _hud_alive() -> bool:
-    import socket
-    try:
-        with socket.create_connection(("localhost", HUD_WS_PORT), timeout=0.3):
-            return True
-    except OSError:
-        return False
 
 
 def _slim(obj: Any, limit: int = 2000) -> Any:
@@ -112,8 +100,10 @@ def _slim(obj: Any, limit: int = 2000) -> Any:
 
 def send_msg(payload: dict[str, Any]) -> None:
     import socket
-    if not _hud_alive():
-        _launch_hud()
+    if not hud_alive():
+        # 不等 HUD 起来：事件在发 UDP 前已写入 sessions.json，HUD 启动时会从文件恢复，
+        # 丢掉这条 UDP 不影响最终状态（原先 sleep(1.5) 拖慢每次 hook）
+        launch_hud()
     try:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:

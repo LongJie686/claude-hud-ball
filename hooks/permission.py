@@ -24,6 +24,8 @@ import fnmatch
 import time
 import platform
 
+from hud_utils import launch_hud, acquire_file_lock, release_file_lock
+
 HUD_WS_PORT = 17890
 TIMEOUT_SECONDS = 60
 # hook 等 HUD 响应的硬上限。须小于 settings.json 里本 hook 的 timeout(600s)。
@@ -31,7 +33,6 @@ TIMEOUT_SECONDS = 60
 # 无人理会时 HUD 自己 60s 就回 fallback，不会真等这么久
 WAIT_RESPONSE_SECONDS = 590
 LAUNCH_WAIT_SECONDS = 1.5
-LOCK_TIMEOUT_SECONDS = 2.0
 IS_WINDOWS = platform.system() == "Windows"
 
 SETTINGS_PATH = os.path.normpath(
@@ -106,37 +107,7 @@ DEFAULT_ASK_TOOLS = {
 }
 
 
-# ---------- 简易文件锁（settings.json 并发写保护）----------
-
-def _acquire_lock(path: str, timeout: float = LOCK_TIMEOUT_SECONDS):
-    """以 O_EXCL 创建 .lock 文件作为锁。stale lock（>10s）自动清理。"""
-    lock_path = path + ".lock"
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
-            return fd, lock_path
-        except FileExistsError:
-            try:
-                if time.time() - os.path.getmtime(lock_path) > 10:
-                    os.unlink(lock_path)
-                    continue
-            except OSError:
-                pass
-            time.sleep(0.05)
-    return None, lock_path
-
-
-def _release_lock(fd, lock_path: str) -> None:
-    try:
-        os.close(fd)
-    except OSError:
-        pass
-    try:
-        os.unlink(lock_path)
-    except OSError:
-        pass
-
+# 文件锁实现移至 hud_utils.acquire_file_lock（指数退避），与 notify.py 共用
 
 # ---------- settings.json 读写 ----------
 
@@ -169,7 +140,7 @@ def load_permissions(cwd: str = "") -> dict[str, list[str]]:
 
 def append_allow_rule(rule: str) -> None:
     """加锁后追加 rule 到 permissions.allow，避免多会话并发覆盖"""
-    fd, lock_path = _acquire_lock(SETTINGS_PATH)
+    fd, lock_path = acquire_file_lock(SETTINGS_PATH)
     if fd is None:
         return
     try:
@@ -194,7 +165,7 @@ def append_allow_rule(rule: str) -> None:
             except OSError:
                 pass
     finally:
-        _release_lock(fd, lock_path)
+        release_file_lock(fd, lock_path)
 
 
 # ---------- 规则匹配 ----------
@@ -448,23 +419,7 @@ def decide(tool_name: str, tool_input: dict, perms: dict[str, list[str]]) -> str
 
 
 # ---------- HUD 通信 ----------
-
-def _launch_hud() -> None:
-    import subprocess
-    script = os.path.normpath(
-        os.path.join(os.path.dirname(__file__), "..", "hud.py")
-    )
-    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-    exe = pythonw if os.path.exists(pythonw) else sys.executable
-    try:
-        subprocess.Popen(
-            [exe, script],
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            close_fds=True,
-        )
-    except Exception:
-        pass
-
+# HUD 拉起逻辑移至 hud_utils.launch_hud，与 notify.py 共用
 
 async def _wait_response(ws, req_id: str) -> tuple[bool, bool, bool]:
     """循环收消息直到拿到对应 req_id 的 permission_response"""
@@ -520,7 +475,7 @@ async def ask_permission(event: dict) -> tuple[bool, bool, bool] | None:
     if result is not None:
         return result
     # 尝试启动 HUD 再试一次
-    _launch_hud()
+    launch_hud()
     await asyncio.sleep(LAUNCH_WAIT_SECONDS)
     return await _try_ask_once(event, req_id)
 

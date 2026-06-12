@@ -64,18 +64,36 @@ def _play_sound(name: str):
         pass
 
 
-def _append_history(entry: dict):
+# history 内存维护、定期落盘（高频 PostToolUse 时避免每条都全量读写文件）
+_history_cache: list = []
+_history_dirty = False
+
+
+def _load_history():
+    global _history_cache
     try:
-        try:
-            with open(HISTORY_FILE, encoding="utf-8") as f:
-                hist = json.load(f)
-        except Exception:
-            hist = []
-        hist.append(entry)
-        if len(hist) > MAX_HISTORY:
-            hist = hist[-MAX_HISTORY:]
+        with open(HISTORY_FILE, encoding="utf-8") as f:
+            _history_cache = json.load(f)
+    except Exception:
+        _history_cache = []
+
+
+def _append_history(entry: dict):
+    global _history_dirty
+    _history_cache.append(entry)
+    if len(_history_cache) > MAX_HISTORY:
+        del _history_cache[:len(_history_cache) - MAX_HISTORY]
+    _history_dirty = True
+
+
+def _flush_history():
+    global _history_dirty
+    if not _history_dirty:
+        return
+    try:
         with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(hist, f, ensure_ascii=False, indent=2)
+            json.dump(_history_cache, f, ensure_ascii=False, indent=2)
+        _history_dirty = False
     except Exception:
         logger.exception("写入 history.json 失败")
 
@@ -151,6 +169,8 @@ class EventBus(QObject):
     permission_response = pyqtSignal(str, bool, bool, bool)
     # 原生确认提醒（敏感文件/MCP 等 hook 无法替代的确认）session_id, msg
     notification = pyqtSignal(str, dict)
+    # 系统级警告（UDP 绑定失败等），在悬浮球上提示
+    system_warning = pyqtSignal(str)
 
 
 bus = EventBus()
@@ -161,6 +181,8 @@ sessions: dict[str, dict] = {}
 pending_permissions: dict[str, tuple] = {}
 # 授权请求与会话的对应关系 request_id -> session_id
 request_sessions: dict[str, str] = {}
+# pending_permissions 被 WS 线程和 Qt 主线程并发读写，必须加锁
+_perm_lock = threading.Lock()
 # WebSocket连接池
 ws_connections: set = set()
 
@@ -297,6 +319,9 @@ def _process_msg(msg: dict):
         threading.Thread(target=_play_sound, args=("permission",), daemon=True).start()
         bus.notification.emit(sid, msg)
 
+    elif mtype == "system_warning":
+        bus.system_warning.emit(msg.get("message", ""))
+
 
 async def ws_handler(websocket):
     ws_connections.add(websocket)
@@ -311,10 +336,12 @@ async def ws_handler(websocket):
                 req_id = msg.get("request_id", str(uuid.uuid4()))
                 loop = asyncio.get_event_loop()
                 future = loop.create_future()
-                pending_permissions[req_id] = (future, websocket)
+                with _perm_lock:
+                    pending_permissions[req_id] = (future, websocket)
                 _msg_queue.put(msg)
                 result = await future
-                pending_permissions.pop(req_id, None)
+                with _perm_lock:
+                    pending_permissions.pop(req_id, None)
                 await websocket.send(json.dumps({
                     "type":         "permission_response",
                     "request_id":   req_id,
@@ -333,10 +360,12 @@ async def ws_handler(websocket):
 
 def on_permission_response(request_id: str, approved: bool, always_allow: bool,
                            fallback: bool = False):
-    if request_id in pending_permissions:
-        future, ws = pending_permissions[request_id]
+    with _perm_lock:
+        entry = pending_permissions.get(request_id)
         # 按 request_id 精确恢复对应会话，避免多会话同时授权时恢复错对象
         sid = request_sessions.pop(request_id, None)
+    if entry is not None:
+        future, ws = entry
         if sid and sessions.get(sid, {}).get("status") == "waiting_permission":
             sessions[sid]["status"] = "waiting"
             bus.session_update.emit(sid, dict(sessions[sid]))
@@ -360,16 +389,46 @@ def run_ws_server(loop: asyncio.AbstractEventLoop):
 
 
 def run_udp_listener():
-    """接收 notify.py 的轻量状态上报（UDP，无需握手）"""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.bind(("127.0.0.1", UDP_PORT))
-    except OSError:
-        logger.exception("UDP 端口 %d 绑定失败", UDP_PORT)
-        return
+    """接收 notify.py 的轻量状态上报（UDP，无需握手）。
+    socket 级故障（端口被占、休眠唤醒后失效）自动重建并指数退避，不让线程死掉。"""
+    sock = None
+    backoff = 1.0
+    warned = False
     while True:
+        if sock is None:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.bind(("127.0.0.1", UDP_PORT))
+                backoff = 1.0
+                warned = False
+            except OSError:
+                logger.exception("UDP 端口 %d 绑定失败，%.0f 秒后重试", UDP_PORT, backoff)
+                if not warned:
+                    _msg_queue.put({"type": "system_warning",
+                                    "message": f"UDP {UDP_PORT} 绑定失败，状态上报暂不可用"})
+                    warned = True
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                sock = None
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
+                continue
         try:
             data, _ = sock.recvfrom(65535)
+        except OSError:
+            logger.exception("UDP socket 失效，重建")
+            try:
+                sock.close()
+            except OSError:
+                pass
+            sock = None
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
+            continue
+        try:
             _msg_queue.put(json.loads(data.decode("utf-8")))
         except Exception:
             logger.exception("UDP 消息处理失败")
@@ -511,30 +570,38 @@ class SessionTab(QFrame):
 
 
 class _HotkeyFilter(QAbstractNativeEventFilter):
-    """全局热键：权限弹窗期间 Alt+Y/N/A/Enter 决策；提醒窗期间 Esc 关闭提醒。
-    用 RegisterHotKey 而非键盘钩子——仅弹窗存在时注册，关闭即注销，平时不占键。"""
+    """全局热键：权限弹窗期间 Alt+Y/N/U/Enter 决策；提醒窗期间 Esc 关闭、Alt+Enter 跳转终端。
+    用 RegisterHotKey 而非键盘钩子——仅弹窗存在时注册，关闭即注销，平时不占键。
+    Alt+Enter 由权限弹窗优先持有，权限热键注销后让位给提醒窗。"""
     WM_HOTKEY = 0x0312
     MOD_ALT = 0x0001
     MOD_NOREPEAT = 0x4000
     VK_ESCAPE = 0x1B
+    VK_RETURN = 0x0D
     PERM_KEYS = {
         1: (0x59, "_allow"),        # Alt+Y
         2: (0x4E, "_deny"),         # Alt+N
-        3: (0x41, "_always"),       # Alt+A
+        3: (0x55, "_always"),       # Alt+U
         4: (0x0D, "_to_terminal"),  # Alt+Enter
     }
     ESC_ID = 5
+    REM_ENTER_ID = 6
 
     def __init__(self):
         super().__init__()
         self._perm_on = False
-        self._esc_on = False
+        self._rem_on = False
+        self._rem_enter_ok = False
 
     def set_perm_hotkeys(self, on: bool):
         if on == self._perm_on:
             return
         user32 = ctypes.windll.user32
         if on:
+            # 权限弹窗优先持有 Alt+Enter，提醒窗的注册先让位
+            if self._rem_enter_ok:
+                user32.UnregisterHotKey(None, self.REM_ENTER_ID)
+                self._rem_enter_ok = False
             for hk_id, (vk, _) in self.PERM_KEYS.items():
                 if not user32.RegisterHotKey(None, hk_id, self.MOD_ALT | self.MOD_NOREPEAT, vk):
                     logger.warning("全局热键注册失败 vk=0x%X（可能被其他程序占用）", vk)
@@ -542,20 +609,43 @@ class _HotkeyFilter(QAbstractNativeEventFilter):
             for hk_id in self.PERM_KEYS:
                 user32.UnregisterHotKey(None, hk_id)
         self._perm_on = on
+        if not on and self._rem_on:
+            self._register_rem_enter()
 
-    def set_esc_hotkey(self, on: bool):
-        if on == self._esc_on:
+    def set_reminder_hotkeys(self, on: bool):
+        if on == self._rem_on:
             return
         user32 = ctypes.windll.user32
         if on:
             if not user32.RegisterHotKey(None, self.ESC_ID, self.MOD_NOREPEAT, self.VK_ESCAPE):
                 logger.warning("Esc 全局热键注册失败（可能被其他程序占用）")
+            self._rem_on = True
+            self._register_rem_enter()
         else:
             user32.UnregisterHotKey(None, self.ESC_ID)
-        self._esc_on = on
+            if self._rem_enter_ok:
+                user32.UnregisterHotKey(None, self.REM_ENTER_ID)
+                self._rem_enter_ok = False
+            self._rem_on = False
+
+    def _register_rem_enter(self):
+        # Alt+Enter 可能正被权限弹窗持有（id 4），权限热键注销时会补调本方法
+        if self._rem_enter_ok or self._perm_on:
+            return
+        self._rem_enter_ok = bool(ctypes.windll.user32.RegisterHotKey(
+            None, self.REM_ENTER_ID, self.MOD_ALT | self.MOD_NOREPEAT, self.VK_RETURN))
+
+    @staticmethod
+    def _focus_reminder_terminal():
+        # 多个提醒时跳第一个（最早的）
+        for sid, dlg in list(ReminderDialog._by_session.items()):
+            ball = dlg.parent()
+            if ball is not None and hasattr(ball, "_focus_terminal"):
+                ball._focus_terminal(sid)
+            return
 
     def nativeEventFilter(self, event_type, message):
-        if (self._perm_on or self._esc_on) and event_type == b"windows_generic_MSG":
+        if (self._perm_on or self._rem_on) and event_type == b"windows_generic_MSG":
             msg = ctypes.wintypes.MSG.from_address(int(message))
             if msg.message == self.WM_HOTKEY:
                 hk_id = int(msg.wParam)
@@ -568,6 +658,9 @@ class _HotkeyFilter(QAbstractNativeEventFilter):
                 if hk_id == self.ESC_ID:
                     for dlg in list(ReminderDialog._by_session.values()):
                         dlg._dismiss()
+                    return True, 0
+                if hk_id == self.REM_ENTER_ID:
+                    self._focus_reminder_terminal()
                     return True, 0
         return False, 0
 
@@ -592,6 +685,7 @@ class PermissionDialog(QDialog):
         super().__init__(parent, Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
         self.request_id = request_id
         self._always_allow = False
+        self._finished = False
         self._remaining = self.TIMEOUT
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setFixedWidth(400)
@@ -603,6 +697,7 @@ class PermissionDialog(QDialog):
 
         # 位置由 FloatingBall._reposition_popups 统一锚定到悬浮球
         PermissionDialog._open_dialogs.append(self)
+        PermissionDialog._refresh_hotkey_target()
         _ensure_hotkey_filter().set_perm_hotkeys(True)
 
     def _setup_ui(self, data: dict):
@@ -610,6 +705,7 @@ class PermissionDialog(QDialog):
         outer.setContentsMargins(0, 0, 0, 0)
 
         card = QFrame()
+        self._card = card
         card.setStyleSheet("""
             QFrame {
                 background: rgba(22,22,30,250);
@@ -694,7 +790,8 @@ class PermissionDialog(QDialog):
         btn_row.addWidget(btn_allow)
         btn_row.addWidget(btn_always_allow)
 
-        keys_hint = QLabel("Alt+Y 允许 · Alt+N 拒绝 · Alt+A 永久允许 · Alt+Enter 转终端")
+        keys_hint = QLabel("Alt+Y 允许 · Alt+N 拒绝 · Alt+U 永久允许 · Alt+Enter 转终端")
+        self._keys_hint = keys_hint
         keys_hint.setStyleSheet(
             "color: #6A6A80; font-size: 10px; background: transparent; border: none;")
         keys_hint.setAlignment(Qt.AlignCenter)
@@ -707,6 +804,25 @@ class PermissionDialog(QDialog):
 
         outer.addWidget(card)
         self.adjustSize()
+
+    @classmethod
+    def _refresh_hotkey_target(cls):
+        # 多弹窗垂直堆叠全部可见，热键作用于最早弹出的那个，给它亮边标识
+        for i, dlg in enumerate(cls._open_dialogs):
+            dlg._set_hotkey_target(i == 0)
+
+    def _set_hotkey_target(self, on: bool):
+        border = "rgba(255,179,26,0.95)" if on else "rgba(255,159,10,0.3)"
+        self._card.setStyleSheet(f"""
+            QFrame {{
+                background: rgba(22,22,30,250);
+                border-radius: 14px;
+                border: 1px solid {border};
+            }}
+        """)
+        self._keys_hint.setText(
+            "Alt+Y 允许 · Alt+N 拒绝 · Alt+U 永久允许 · Alt+Enter 转终端" if on
+            else "热键作用于亮边弹窗（最早弹出）")
 
     def _tick(self):
         self._remaining -= 1
@@ -754,10 +870,16 @@ class PermissionDialog(QDialog):
             super().reject()
 
     def _finish(self, approved: bool, always: bool, fallback: bool = False):
+        # 防重入：热键/点击可能在弹窗关闭前对同一请求触发多次
+        if self._finished:
+            return
+        self._finished = True
         if self in PermissionDialog._open_dialogs:
             PermissionDialog._open_dialogs.remove(self)
         if not PermissionDialog._open_dialogs:
             _ensure_hotkey_filter().set_perm_hotkeys(False)
+        else:
+            PermissionDialog._refresh_hotkey_target()
         bus.permission_response.emit(self.request_id, approved, always, fallback)
         self.accept()
         ball = self.parent()
@@ -779,7 +901,7 @@ class ReminderDialog(QDialog):
         self._setup_ui(data)
         # 位置由 FloatingBall._reposition_popups 统一锚定到悬浮球
         ReminderDialog._by_session[session_id] = self
-        _ensure_hotkey_filter().set_esc_hotkey(True)
+        _ensure_hotkey_filter().set_reminder_hotkeys(True)
 
     def _setup_ui(self, data: dict):
         outer = QVBoxLayout(self)
@@ -802,7 +924,7 @@ class ReminderDialog(QDialog):
         self._title_label = QLabel(self._title_for(data.get("message", "")))
         self._title_label.setStyleSheet(
             "color: #5E9EFF; font-size: 14px; font-weight: bold;")
-        hint = QLabel("点击或 Esc 关闭")
+        hint = QLabel("点击/Esc 关闭 · Alt+Enter 跳终端")
         hint.setStyleSheet("color: #6A6A80; font-size: 11px;")
         title_row.addWidget(self._title_label)
         title_row.addStretch()
@@ -847,7 +969,7 @@ class ReminderDialog(QDialog):
     def _dismiss(self):
         ReminderDialog._by_session.pop(self.session_id, None)
         if not ReminderDialog._by_session:
-            _ensure_hotkey_filter().set_esc_hotkey(False)
+            _ensure_hotkey_filter().set_reminder_hotkeys(False)
         self.accept()
         ball = self.parent()
         if ball is not None and hasattr(ball, "_reposition_popups"):
@@ -915,11 +1037,7 @@ class HistoryDialog(QDialog):
         box.setStyleSheet(
             "QTextEdit { background: #16161E; color: #D8D8E8; border: none;"
             " font-family: Consolas, monospace; font-size: 12px; }")
-        try:
-            with open(HISTORY_FILE, encoding="utf-8") as f:
-                hist = json.load(f)
-        except Exception:
-            hist = []
+        hist = list(_history_cache)
         lines = []
         for e in reversed(hist):
             cwd = e.get("cwd", "")
@@ -1028,15 +1146,21 @@ class SessionPanel(QWidget):
             if self._filter_sid == session_id:
                 self.set_filter(None)
         else:
-            if session_id not in self._session_tabs:
+            created = session_id not in self._session_tabs
+            if created:
                 tab = SessionTab(session_id)
                 tab.clicked.connect(self._show_detail)
                 tab.setVisible(self._filter_sid is None)
                 self._session_tabs[session_id] = tab
                 idx = self._tabs_layout.count() - 1
                 self._tabs_layout.insertWidget(idx, tab)
-            self._session_tabs[session_id].update_state(state)
-            self._sort_tabs()
+            tab = self._session_tabs[session_id]
+            prev_status = getattr(tab, "_last_status", None)
+            tab.update_state(state)
+            tab._last_status = state.get("status")
+            # 仅状态变化才重排，高频消息时避免每条都全量重排
+            if created or tab._last_status != prev_status:
+                self._sort_tabs()
 
         has = len(self._session_tabs) > 0
         self._empty_label.setVisible(not has)
@@ -1230,7 +1354,7 @@ class FloatingBall(QWidget):
         self._icon_angle = 0
         self._spin_timer = QTimer(self)
         self._spin_timer.timeout.connect(self._spin_tick)
-        self._spin_timer.start(40)
+        self._update_spin()
 
         screen = QApplication.primaryScreen().availableGeometry()
         self.move(screen.right() - 80, screen.bottom() - 60)
@@ -1259,9 +1383,14 @@ class FloatingBall(QWidget):
         self._cleanup_timer.timeout.connect(self._cleanup_stale_sessions)
         self._cleanup_timer.start(60_000)
 
+        self._hist_flush_timer = QTimer(self)
+        self._hist_flush_timer.timeout.connect(_flush_history)
+        self._hist_flush_timer.start(30_000)
+
         bus.session_update.connect(self._on_session_update)
         bus.permission_request.connect(self._on_permission_request)
         bus.notification.connect(self._on_notification)
+        bus.system_warning.connect(self._on_system_warning)
 
     def _cleanup_stale_sessions(self):
         now = time.time()
@@ -1302,12 +1431,25 @@ class FloatingBall(QWidget):
                 logger.exception("处理消息失败: type=%s", msg.get("type"))
 
     def _blink_tick(self):
+        # 没有出错会话且当前不在闪烁半程时跳过重绘
+        has_error = any(s.get("status") == "error" for s in sessions.values())
+        if not has_error and not self._blink_state:
+            return
         self._blink_state = not self._blink_state
         self.update()
 
     def _spin_tick(self):
         self._icon_angle = (self._icon_angle + 2) % 360
         self.update()
+
+    def _update_spin(self):
+        # 空闲不转：没有 working 会话时停掉 40ms 旋转定时器省 CPU
+        active = any(s.get("status") == "working" for s in sessions.values())
+        if active and not self._spin_timer.isActive():
+            self._spin_timer.start(40)
+        elif not active and self._spin_timer.isActive():
+            self._spin_timer.stop()
+            self.update()
 
     def _dots_x0(self) -> int:
         return self.PADDING + self.ICON_SIZE + self.BALL_GAP
@@ -1563,8 +1705,12 @@ class FloatingBall(QWidget):
         dlg.raise_()
         dlg.activateWindow()
 
+    def _on_system_warning(self, message: str):
+        QToolTip.showText(self.mapToGlobal(QPoint(0, -34)), f"HUD 警告: {message}", self)
+
     def _on_session_update(self, session_id: str, state: dict):
         self._panel.update_session(session_id, state)
+        self._update_spin()
         self._refresh_size()
         self.update()
         if self._panel.isVisible():
@@ -1615,9 +1761,6 @@ class FloatingBall(QWidget):
 
 
 # 保持向后兼容的别名
-FloatingHUD = FloatingBall
-
-
 def _already_running() -> bool:
     """通过 WS 端口探测是否已有 HUD 实例，避免重复启动产生僵尸悬浮球"""
     try:
@@ -1635,6 +1778,7 @@ def main():
     # 先从文件恢复已有 session 状态
     persisted = load_persisted_sessions()
     sessions.update(persisted)
+    _load_history()
 
     loop = asyncio.new_event_loop()
     ws_thread = threading.Thread(target=run_ws_server, args=(loop,), daemon=True)
@@ -1646,8 +1790,9 @@ def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("Claude Code HUD")
+    app.aboutToQuit.connect(_flush_history)
 
-    hud = FloatingHUD()
+    hud = FloatingBall()
 
     # 把恢复的 session 渲染到 UI
     for sid, state in persisted.items():
