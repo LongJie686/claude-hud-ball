@@ -16,6 +16,8 @@ import os
 import time
 import socket
 import logging
+import ctypes
+import ctypes.wintypes
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 
@@ -106,7 +108,8 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import (
     Qt, QPoint, QPointF, QTimer, QPropertyAnimation, QEasingCurve,
-    pyqtSignal, QObject, QThread, QRect, QSize
+    pyqtSignal, QObject, QThread, QRect, QRectF, QSize,
+    QAbstractNativeEventFilter
 )
 from PyQt5.QtGui import (
     QPainter, QColor, QBrush, QPen, QFont, QFontMetrics,
@@ -121,11 +124,11 @@ UDP_PORT = 17891  # 状态上报（fire-and-forget，hook 端零依赖）
 
 STATUS_COLORS = {
     "idle":               QColor(90, 90, 110),     # 蓝灰 #5A5A6E
-    "working":            QColor(0, 229, 160),     # 荧光青绿 #00E5A0
+    "working":            QColor(76, 175, 80),     # 青草绿 #4CAF50
     "waiting":            QColor(255, 234, 0),     # 明艳黄 #FFEA00
-    "waiting_permission": QColor(255, 159, 10),    # 亮橙 #FF9F0A
+    "waiting_permission": QColor(255, 179, 26),    # 明亮橙 #FFB31A
     "error":              QColor(255, 77, 109),    # 霓虹粉红 #FF4D6D
-    "done":               QColor(0, 229, 160),
+    "done":               QColor(76, 175, 80),
 }
 
 TOOL_LABELS = {
@@ -507,6 +510,79 @@ class SessionTab(QFrame):
             self.elapsed_label.setText("")
 
 
+class _HotkeyFilter(QAbstractNativeEventFilter):
+    """全局热键：权限弹窗期间 Alt+Y/N/A/Enter 决策；提醒窗期间 Esc 关闭提醒。
+    用 RegisterHotKey 而非键盘钩子——仅弹窗存在时注册，关闭即注销，平时不占键。"""
+    WM_HOTKEY = 0x0312
+    MOD_ALT = 0x0001
+    MOD_NOREPEAT = 0x4000
+    VK_ESCAPE = 0x1B
+    PERM_KEYS = {
+        1: (0x59, "_allow"),        # Alt+Y
+        2: (0x4E, "_deny"),         # Alt+N
+        3: (0x41, "_always"),       # Alt+A
+        4: (0x0D, "_to_terminal"),  # Alt+Enter
+    }
+    ESC_ID = 5
+
+    def __init__(self):
+        super().__init__()
+        self._perm_on = False
+        self._esc_on = False
+
+    def set_perm_hotkeys(self, on: bool):
+        if on == self._perm_on:
+            return
+        user32 = ctypes.windll.user32
+        if on:
+            for hk_id, (vk, _) in self.PERM_KEYS.items():
+                if not user32.RegisterHotKey(None, hk_id, self.MOD_ALT | self.MOD_NOREPEAT, vk):
+                    logger.warning("全局热键注册失败 vk=0x%X（可能被其他程序占用）", vk)
+        else:
+            for hk_id in self.PERM_KEYS:
+                user32.UnregisterHotKey(None, hk_id)
+        self._perm_on = on
+
+    def set_esc_hotkey(self, on: bool):
+        if on == self._esc_on:
+            return
+        user32 = ctypes.windll.user32
+        if on:
+            if not user32.RegisterHotKey(None, self.ESC_ID, self.MOD_NOREPEAT, self.VK_ESCAPE):
+                logger.warning("Esc 全局热键注册失败（可能被其他程序占用）")
+        else:
+            user32.UnregisterHotKey(None, self.ESC_ID)
+        self._esc_on = on
+
+    def nativeEventFilter(self, event_type, message):
+        if (self._perm_on or self._esc_on) and event_type == b"windows_generic_MSG":
+            msg = ctypes.wintypes.MSG.from_address(int(message))
+            if msg.message == self.WM_HOTKEY:
+                hk_id = int(msg.wParam)
+                if hk_id in self.PERM_KEYS:
+                    dialogs = PermissionDialog._open_dialogs
+                    if dialogs:
+                        # 多弹窗时作用于最早弹出的那个（等待最久的请求）
+                        getattr(dialogs[0], self.PERM_KEYS[hk_id][1])()
+                    return True, 0
+                if hk_id == self.ESC_ID:
+                    for dlg in list(ReminderDialog._by_session.values()):
+                        dlg._dismiss()
+                    return True, 0
+        return False, 0
+
+
+_hotkey_filter = None
+
+
+def _ensure_hotkey_filter() -> _HotkeyFilter:
+    global _hotkey_filter
+    if _hotkey_filter is None:
+        _hotkey_filter = _HotkeyFilter()
+        QApplication.instance().installNativeEventFilter(_hotkey_filter)
+    return _hotkey_filter
+
+
 class PermissionDialog(QDialog):
     TIMEOUT = 60
     # 当前打开的弹窗，用于并发请求时垂直堆叠、避免互相遮挡
@@ -527,6 +603,7 @@ class PermissionDialog(QDialog):
 
         # 位置由 FloatingBall._reposition_popups 统一锚定到悬浮球
         PermissionDialog._open_dialogs.append(self)
+        _ensure_hotkey_filter().set_perm_hotkeys(True)
 
     def _setup_ui(self, data: dict):
         outer = QVBoxLayout(self)
@@ -617,10 +694,16 @@ class PermissionDialog(QDialog):
         btn_row.addWidget(btn_allow)
         btn_row.addWidget(btn_always_allow)
 
+        keys_hint = QLabel("Alt+Y 允许 · Alt+N 拒绝 · Alt+A 永久允许 · Alt+Enter 转终端")
+        keys_hint.setStyleSheet(
+            "color: #6A6A80; font-size: 10px; background: transparent; border: none;")
+        keys_hint.setAlignment(Qt.AlignCenter)
+
         layout.addLayout(title_row)
         layout.addWidget(info)
         layout.addWidget(detail_box)
         layout.addLayout(btn_row)
+        layout.addWidget(keys_hint)
 
         outer.addWidget(card)
         self.adjustSize()
@@ -673,6 +756,8 @@ class PermissionDialog(QDialog):
     def _finish(self, approved: bool, always: bool, fallback: bool = False):
         if self in PermissionDialog._open_dialogs:
             PermissionDialog._open_dialogs.remove(self)
+        if not PermissionDialog._open_dialogs:
+            _ensure_hotkey_filter().set_perm_hotkeys(False)
         bus.permission_response.emit(self.request_id, approved, always, fallback)
         self.accept()
         ball = self.parent()
@@ -694,6 +779,7 @@ class ReminderDialog(QDialog):
         self._setup_ui(data)
         # 位置由 FloatingBall._reposition_popups 统一锚定到悬浮球
         ReminderDialog._by_session[session_id] = self
+        _ensure_hotkey_filter().set_esc_hotkey(True)
 
     def _setup_ui(self, data: dict):
         outer = QVBoxLayout(self)
@@ -716,7 +802,7 @@ class ReminderDialog(QDialog):
         self._title_label = QLabel(self._title_for(data.get("message", "")))
         self._title_label.setStyleSheet(
             "color: #5E9EFF; font-size: 14px; font-weight: bold;")
-        hint = QLabel("点击关闭")
+        hint = QLabel("点击或 Esc 关闭")
         hint.setStyleSheet("color: #6A6A80; font-size: 11px;")
         title_row.addWidget(self._title_label)
         title_row.addStretch()
@@ -760,6 +846,8 @@ class ReminderDialog(QDialog):
 
     def _dismiss(self):
         ReminderDialog._by_session.pop(self.session_id, None)
+        if not ReminderDialog._by_session:
+            _ensure_hotkey_filter().set_esc_hotkey(False)
         self.accept()
         ball = self.parent()
         if ball is not None and hasattr(ball, "_reposition_popups"):
@@ -1118,7 +1206,7 @@ class FloatingBall(QWidget):
     BALL_GAP = 6
     PADDING = 10
     ICON_SIZE = 16
-    ICON_COLOR = QColor(255, 159, 10)  # 霓虹亮橙（赛博主题，原 Claude 品牌橙 217,119,87）
+    ICON_COLOR = QColor(255, 179, 26)  # 明亮橙 #FFB31A（赛博主题，原 Claude 品牌橙 217,119,87）
 
     def __init__(self):
         super().__init__(None)
@@ -1236,6 +1324,24 @@ class FloatingBall(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+
+        # 玻璃胶囊球体：半透明渐变底 + 顶部高光弧 + 浅描边（仿毛玻璃）
+        body = QRectF(self.rect()).adjusted(0.75, 0.75, -0.75, -0.75)
+        radius = body.height() / 2
+        grad = QLinearGradient(body.topLeft(), body.bottomLeft())
+        grad.setColorAt(0.0, QColor(46, 48, 66, 150))
+        grad.setColorAt(1.0, QColor(16, 16, 26, 178))
+        painter.setPen(QPen(QColor(255, 255, 255, 52), 1.0))
+        painter.setBrush(QBrush(grad))
+        painter.drawRoundedRect(body, radius, radius)
+        hi = QRectF(body.x() + radius * 0.5, body.y() + 1.8,
+                    body.width() - radius, body.height() * 0.40)
+        hg = QLinearGradient(hi.topLeft(), hi.bottomLeft())
+        hg.setColorAt(0.0, QColor(255, 255, 255, 46))
+        hg.setColorAt(1.0, QColor(255, 255, 255, 0))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(hg))
+        painter.drawRoundedRect(hi, hi.height() / 2, hi.height() / 2)
 
         # Claude 星芒图标：悬浮显示全部会话
         cy = self.height() / 2
