@@ -1,7 +1,7 @@
 # Claude Code HUD 悬浮球
 
-**当前版本**: 1.1
-**更新日期**: 2026-06-11
+**当前版本**: 1.2
+**更新日期**: 2026-06-12
 
 一个 Windows 桌面悬浮球，用于同时监控多个 Claude Code 会话，并把权限确认从终端搬到桌面弹窗。基于 PyQt5，通过 Claude Code 的 hooks 机制驱动，无需修改 Claude Code 本体。
 
@@ -10,8 +10,9 @@
 - **多会话状态点**：悬浮球上每个会话一个圆点，颜色区分 工作中 / 等待 / 空闲 / 出错，悬停展开面板查看各会话详情（目录、当前工具、耗时）
 - **点击聚焦终端**：点会话点自动把对应终端窗口带到前台（已处理 Win11 ConPTY 幻影窗委托），并气泡提示该会话目录；窗口已关闭时自动移除该点
 - **弹弓小游戏**：按住会话点拖动会拉出一把弹弓，松手把点弹飞——抛物线飞行、屏幕边缘反弹、彗星拖尾，约 2.4 秒后自动飞回原位归队，纯属解压，不影响单击聚焦
-- **赛博霓虹配色**：深底霓虹全套主题，状态色一眼区分——工作青绿、等待明黄、待授权橙、出错粉红；权限弹窗、提醒窗、面板、菜单、弹弓统一风格
+- **赛博霓虹配色 + 玻璃球体**：深底霓虹全套主题，状态色一眼区分——工作草绿、等待明黄、待授权橙、出错粉红；悬浮球为玻璃质感胶囊体（半透明渐变 + 顶部高光）；权限弹窗、提醒窗、面板、菜单、弹弓统一风格
 - **权限弹窗**：拦截需要确认的 Bash / Edit / Write 等工具调用，桌面弹窗提供 拒绝 / 转终端 / 允许 / 永久允许 四个选项，60 秒无人理会自动交回终端原生确认，鼠标悬停时暂停倒计时
+- **全局快捷键**：权限弹窗期间在任意窗口按 Alt+Y 允许 / Alt+N 拒绝 / Alt+U 永久允许 / Alt+Enter 转终端（仅弹窗存在时注册热键，关闭即注销；多弹窗时亮边标识热键作用目标）；提醒窗期间 Esc 关闭、Alt+Enter 跳转对应终端
 - **永久允许**：一键把当前命令写成 `settings.json` 的 allow 规则（危险命令只生成精确规则，不生成宽规则）
 - **原生确认提醒**：遇到 hook 无法替代的原生确认（敏感文件等）时弹提醒窗，叫你回终端操作
 - **历史记录**：右键悬浮球查看所有会话的工具调用历史（操作对象摘要一行一条）
@@ -22,8 +23,9 @@
 Claude Code hooks
   ├─ hooks/notify.py      状态上报（PreToolUse/PostToolUse/Stop/SessionStart/SessionEnd/Notification）
   │     └─ UDP 127.0.0.1:17891 → hud.py（fire-and-forget，hook 轻量退出）
-  └─ hooks/permission.py  权限决策（PreToolUse，匹配 Bash|Edit|Write|MultiEdit|NotebookEdit）
-        └─ WS  127.0.0.1:17890 → hud.py 弹窗 → 决策按官方 hook 协议回传 Claude Code
+  ├─ hooks/permission.py  权限决策（PreToolUse，匹配 Bash|Edit|Write|MultiEdit|NotebookEdit）
+  │     └─ WS  127.0.0.1:17890 → hud.py 弹窗 → 决策按官方 hook 协议回传 Claude Code
+  └─ hooks/hud_utils.py   两个 hook 共用：HUD 存活探测/拉起、跨进程文件锁
 
 hud.py          PyQt5 常驻进程：悬浮球 + 弹窗 + WS/UDP 服务端，hook 发现未运行会自动拉起
 start_hud.pyw   开机自启脚本（已运行则跳过）
@@ -105,6 +107,12 @@ pip install PyQt5 websockets
 - hooks 由系统 Python 运行，修改 `hooks/` 下脚本即时生效；修改 `hud.py` 需重启 HUD 进程
 
 ## 更新日志
+
+### 1.2 (2026-06-12)
+
+- 全局快捷键：权限弹窗 Alt+Y 允许 / Alt+N 拒绝 / Alt+U 永久允许 / Alt+Enter 转终端；提醒窗 Esc 关闭、Alt+Enter 跳转终端；多弹窗亮边标识热键目标
+- 悬浮球玻璃质感胶囊体；状态绿调整为草绿，黄/橙提亮、紫加深
+- 12 项稳定性/性能优化：UDP 监听自愈、跨线程/跨进程加锁、弹窗防重入、空闲停转动画、历史记录批量落盘、hooks 公共模块 hud_utils.py 等
 
 ### 1.1 (2026-06-11)
 
