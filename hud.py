@@ -1223,10 +1223,11 @@ class SlingOverlay(QWidget):
         self.update()
 
     def add_dot(self, sid: str, pos: QPointF, vel: QPointF, color: QColor,
-                home_fn, done_fn):
+                home_fn, done_fn, launch: dict | None = None):
         self._ensure_geometry()
         self._dots.append({"sid": sid, "pos": pos, "vel": vel, "color": color,
-                           "t": 0.0, "phase": "fly", "trail": [],
+                           "t": 0.0, "phase": "launch" if launch else "fly",
+                           "launch": launch, "trail": [],
                            "home_fn": home_fn, "done_fn": done_fn})
         if not self.isVisible():
             self.show()
@@ -1243,7 +1244,21 @@ class SlingOverlay(QWidget):
         geo = self.geometry()
         finished = []
         for d in self._dots:
-            if d["phase"] == "fly":
+            if d["phase"] == "launch":
+                # 皮筋加速段：从松手点向叉口匀加速，过叉口转自由飞行（重力接管）
+                la = d["launch"]
+                # 胡克定律：a = omega^2 * 剩余拉伸，刚松手力最大、贴近叉口归零
+                accel = la["omega"] ** 2 * max(la["remain"], 0.0)
+                d["vel"] = d["vel"] + la["dir"] * (accel * dt)
+                sp = math.hypot(d["vel"].x(), d["vel"].y())
+                if sp > la["vmax"]:
+                    d["vel"] = la["dir"] * la["vmax"]
+                step = d["vel"] * dt
+                la["remain"] -= math.hypot(step.x(), step.y())
+                d["pos"] = d["pos"] + step
+                if la["remain"] <= 0:
+                    d["phase"] = "fly"
+            elif d["phase"] == "fly":
                 d["t"] += dt
                 d["vel"].setY(d["vel"].y() + self.GRAVITY * dt)
                 d["pos"] = d["pos"] + d["vel"] * dt
@@ -1313,6 +1328,21 @@ class SlingOverlay(QWidget):
             p.drawEllipse(QPointF(a.x() - px, a.y() - py), 2.5, 2.5)
             self._draw_dot(p, c, self._pull["color"])
         for d in self._dots:
+            if d["phase"] == "launch":
+                # 加速段皮筋跟着球回弹，过叉口后消失
+                la = d["launch"]
+                a = la["anchor"] - off
+                cpos = d["pos"] - off
+                ux, uy = la["dir"].x(), la["dir"].y()
+                px, py = -uy * 8, ux * 8
+                p.setPen(QPen(QColor(0, 229, 160, 190), 2.2,
+                              Qt.SolidLine, Qt.RoundCap))
+                p.drawLine(QPointF(a.x() + px, a.y() + py), cpos)
+                p.drawLine(QPointF(a.x() - px, a.y() - py), cpos)
+                p.setPen(Qt.NoPen)
+                p.setBrush(QBrush(QColor(110, 91, 255, 230)))
+                p.drawEllipse(QPointF(a.x() + px, a.y() + py), 2.5, 2.5)
+                p.drawEllipse(QPointF(a.x() - px, a.y() - py), 2.5, 2.5)
             trail = d["trail"]
             n = len(trail)
             for i, tp in enumerate(trail):
@@ -1617,11 +1647,17 @@ class FloatingBall(QWidget):
             ov.maybe_hide()
             self.update()
             return
-        speed = min(dist * 9.0, 3200.0)
-        vel = QPointF(pull.x() / dist * speed, pull.y() / dist * speed)
-        ov.add_dot(sid, QPointF(gpos), vel, sling["color"],
+        direction = QPointF(pull.x() / dist, pull.y() / dist)
+        # 胡克定律皮筋：加速度正比剩余拉伸量（初段最猛、到叉口归零），
+        # 即简谐运动四分之一周期，时长恒定 LAUNCH_T，出口速度 = omega*拉伸 随拉长线性变大
+        LAUNCH_T = 0.12
+        omega = (math.pi / 2) / LAUNCH_T
+        v_max = min(omega * dist, 20000.0)
+        launch = {"dir": direction, "omega": omega,
+                  "vmax": v_max, "remain": dist, "anchor": QPointF(sling["anchor"])}
+        ov.add_dot(sid, QPointF(gpos), QPointF(0.0, 0.0), sling["color"],
                    home_fn=lambda s=sid: self._dot_center_global(s),
-                   done_fn=self._sling_done)
+                   done_fn=self._sling_done, launch=launch)
 
     def _sling_done(self, sid: str):
         self._flying_hidden.discard(sid)
