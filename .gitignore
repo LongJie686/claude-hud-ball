@@ -2,6 +2,10 @@
 sessions.json
 history.json
 logs/
+config.json
+
+# 内部项目管理
+.claude/
 
 # Python
 __pycache__/

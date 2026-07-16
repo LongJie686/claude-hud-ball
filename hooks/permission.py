@@ -41,6 +41,25 @@ SETTINGS_PATH = os.path.normpath(
 LOG_DIR = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
 )
+CONFIG_PATH = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.json")
+)
+
+
+def auto_allow_enabled(session_id: str = "") -> bool:
+    """HUD「自动放行模式」开关，config.json 由悬浮球右键菜单写入。
+    全局开关（auto_allow）或本会话开关（auto_allow_sessions[sid]）任一开启即免确认；
+    除 deny 规则外全部放行；文件缺失/损坏一律视为关闭。"""
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return False
+    if cfg.get("auto_allow", False):
+        return True
+    if session_id:
+        return bool((cfg.get("auto_allow_sessions") or {}).get(session_id, False))
+    return False
 
 
 def _setup_logger():
@@ -140,6 +159,9 @@ def load_permissions(cwd: str = "") -> dict[str, list[str]]:
 
 def append_allow_rule(rule: str) -> None:
     """加锁后追加 rule 到 permissions.allow，避免多会话并发覆盖"""
+    if not _is_persistable_rule(rule):
+        logger.warning("拒绝写入不可持久化规则（含换行/格式非法）: %r", (rule or "")[:120])
+        return
     fd, lock_path = acquire_file_lock(SETTINGS_PATH)
     if fd is None:
         return
@@ -178,6 +200,20 @@ def parse_rule(rule: str) -> tuple[str, str] | None:
     if not m:
         return None
     return m.group(1), (m.group(2) or "").strip()
+
+
+def _is_persistable_rule(rule: str) -> bool:
+    """规则能否安全写入 settings.json。
+
+    含换行的规则会让 Claude Code /doctor 报「Empty parentheses」非法规则，
+    而本模块 parse_rule 的 _RULE_RE 用 (.*)（. 不匹配换行）同样命中不了它，
+    等于写出一条两边都用不了的垃圾规则。故只持久化 parse_rule 能解析的单行规则。
+    """
+    if not rule or "\n" in rule or "\r" in rule:
+        return False
+    if rule.strip().endswith("()"):   # /doctor: "Empty parentheses" 非法
+        return False
+    return parse_rule(rule) is not None
 
 
 def match_rule(rule: str, tool_name: str, tool_input: dict) -> bool:
@@ -451,6 +487,10 @@ async def _try_ask_once(event: dict, req_id: str) -> tuple[bool, bool, bool] | N
                 "tool_input":      event.get("tool_input", {}),
                 "cwd":             event.get("cwd") or os.getcwd(),
                 "timeout_seconds": TIMEOUT_SECONDS,
+                # 「永久允许」将写入的规则预览；空串 = 无法生成规则、仅放行本次
+                "allow_rule":      build_allow_rule(
+                    event.get("tool_name", ""),
+                    event.get("tool_input", {})) or "",
             }))
             try:
                 return await asyncio.wait_for(
@@ -493,14 +533,51 @@ def _safe_shlex_split(cmd: str) -> list[str]:
             return cmd.split()
 
 
-# 这些命令破坏性强，"永久允许"只生成精确规则，绝不生成 head:* 宽规则
+# 这些命令破坏性强，"永久允许"只生成精确规则，绝不生成 head:* 宽规则。
+# 解释器（python/powershell 等）不在列：2026-07-10 用户明确选择便利优先、
+# 宽规则直接放行；弹窗有"将写入规则"预览兜底，点之前知情即可
 DANGEROUS_BASH_HEADS = {
     "rm", "del", "rmdir", "rd", "dd", "mkfs", "format", "shred", "diskpart",
     "shutdown", "reboot", "taskkill", "mv", "move", "git push", "git reset",
 }
 
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
-def build_allow_rule(tool_name: str, tool_input: dict) -> str:
+
+def _extract_bash_head(cmd: str) -> tuple[str, list[str]] | None:
+    """提取命令头（含二级子命令，如 'git add'、'opencli browser'）。
+    跳过前导 VAR=value 环境变量（曾产出 Bash(MSYS_NO_PATHCONV=1 docker:*) 垃圾规则）。
+    返回 (head, tokens)；空命令返回 None。"""
+    tokens = _safe_shlex_split(cmd)
+    while tokens and _ENV_ASSIGN_RE.match(tokens[0]):
+        tokens = tokens[1:]
+    if not tokens:
+        return None
+    head = tokens[0]
+    if len(tokens) >= 2:
+        t1 = tokens[1]
+        # 第二个 token 必须是简单子命令名才扩展（避免把文件路径写进规则）
+        if (t1 and not t1.startswith("-") and " " not in t1
+                and "/" not in t1 and "\\" not in t1
+                and not any(ch in t1 for ch in ";|&<>*?[")):
+            head = f"{tokens[0]} {t1}"
+    return head, tokens
+
+
+def _head_is_dangerous(head: str, tokens: list[str]) -> bool:
+    """head 本身、首 token、及去路径/去 .exe 后的程序名任一命中即视为危险"""
+    if head.lower() in DANGEROUS_BASH_HEADS:
+        return True
+    t0 = tokens[0].lower()
+    if t0 in DANGEROUS_BASH_HEADS:
+        return True
+    base = os.path.basename(t0.replace("\\", "/"))
+    if base.endswith(".exe"):
+        base = base[:-4]
+    return base in DANGEROUS_BASH_HEADS
+
+
+def build_allow_rule(tool_name: str, tool_input: dict) -> str | None:
     if not isinstance(tool_input, dict):
         return tool_name
 
@@ -508,23 +585,41 @@ def build_allow_rule(tool_name: str, tool_input: dict) -> str:
         cmd = (tool_input.get("command", "") or "").strip()
         if not cmd:
             return tool_name
-        # 组合命令：宽规则语义不明（曾产出 Bash(sleep 240;:*) 垃圾规则），写整条精确规则
-        if len(split_bash_subcommands(cmd)) > 1:
-            return f"Bash({cmd})"
-        tokens = _safe_shlex_split(cmd)
-        if not tokens:
+        subs = split_bash_subcommands(cmd)
+        if len(subs) > 1:
+            # 组合命令：忽略内置安全段（grep/head/echo 等管道消费者）后，
+            # 若其余段头部一致且不危险 → 生成公共前缀规则（如 Bash(opencli browser:*)），
+            # 这样 `opencli ... && opencli ...` 点一次永久允许即可覆盖后续同类命令。
+            # 头部不一致 → 退回整条精确规则；含换行的精确规则无法持久化 → None（放行不落盘）
+            heads: dict[str, str] = {}   # lower -> 原始大小写（首见）
+            dangerous = False
+            # heredoc 正文/重定向目标不是命令，逐段提头会产出 Bash(EOF:*) 类垃圾规则；
+            # 且 _decide_bash 对危险结构命令一律 ask，前缀规则也用不上 → 不做前缀提取
+            if has_dangerous_shell_structure(cmd):
+                dangerous = True
+            for s in subs:
+                if _is_safe_subcommand(s):
+                    continue
+                parsed = _extract_bash_head(s)
+                if not parsed:
+                    continue
+                h, toks = parsed
+                heads.setdefault(h.lower(), h)
+                if _head_is_dangerous(h, toks):
+                    dangerous = True
+            if len(heads) == 1 and not dangerous:
+                rule = f"Bash({next(iter(heads.values()))}:*)"
+                if _is_persistable_rule(rule):
+                    return rule
+            rule = f"Bash({cmd})"
+            return rule if _is_persistable_rule(rule) else None
+        parsed = _extract_bash_head(cmd)
+        if not parsed:
             return tool_name
-        head = tokens[0]
-        if len(tokens) >= 2:
-            t1 = tokens[1]
-            # 第二个 token 必须是简单子命令名才扩展（避免把文件路径写进规则）
-            if (t1 and not t1.startswith("-") and " " not in t1
-                    and "/" not in t1 and "\\" not in t1
-                    and not any(ch in t1 for ch in ";|&<>*?[")):
-                head = f"{tokens[0]} {t1}"
-        if head.lower() in DANGEROUS_BASH_HEADS \
-                or tokens[0].lower() in DANGEROUS_BASH_HEADS:
-            return f"Bash({cmd})"
+        head, tokens = parsed
+        if _head_is_dangerous(head, tokens):
+            rule = f"Bash({cmd})"
+            return rule if _is_persistable_rule(rule) else None
         return f"Bash({head}:*)"
 
     if tool_name in ("Read", "Edit", "Write", "MultiEdit", "NotebookEdit", "NotebookRead"):
@@ -618,6 +713,14 @@ def main() -> None:
         emit_decision("deny", "被 settings.json permissions.deny 规则拒绝")
         sys.exit(0)
 
+    # HUD「自动放行模式」：全局或本会话开关开启时，除 deny 外全部免确认放行
+    # （含危险命令，用户明确选择）。敏感文件（~/.claude/、.env）CC 内置保护层
+    # 仍会强制原生确认，hook 的 allow 穿不过
+    if auto_allow_enabled(event.get("session_id", "")):
+        logger.info("自动放行模式放行: %s %s", tool_name, str(tool_input)[:200])
+        emit_decision("allow", "HUD 自动放行模式开启")
+        sys.exit(0)
+
     # 敏感文件（~/.claude/ 下、.env）：Claude Code 内置保护层会在 hook 之后强制原生
     # 确认，hook 的 allow 穿不过。HUD 再弹窗就成了双重确认，故直接转原生只确认一次，
     # 由 Notification hook 触发 HUD 提醒窗叫用户去终端
@@ -645,11 +748,17 @@ def main() -> None:
 
     if approved and always_allow:
         rule = build_allow_rule(tool_name, tool_input)
-        try:
-            append_allow_rule(rule)
-            logger.info("永久允许规则已写入: %s", rule)
-        except Exception:
-            logger.exception("写入永久允许规则失败: %s", rule)
+        if rule and _is_persistable_rule(rule):
+            try:
+                append_allow_rule(rule)
+                logger.info("永久允许规则已写入: %s", rule)
+            except Exception:
+                logger.exception("写入永久允许规则失败: %s", rule)
+        else:
+            cmd_preview = (tool_input.get("command", "") if tool_name == "Bash"
+                           else tool_name)
+            logger.info("命令无法生成可持久化规则，本次放行但不写永久规则: %s",
+                        str(cmd_preview)[:120])
 
     if approved:
         emit_decision("allow", "用户在 HUD 批准")

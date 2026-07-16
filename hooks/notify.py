@@ -191,6 +191,68 @@ def _find_terminal_hwnd() -> "tuple[int, int]":
     return 0, 0
 
 
+def _find_cc_pid() -> "tuple[int, str]":
+    """沿父进程链找 Claude Code 主进程（node/claude/bun/deno）。
+    终端标签被直接关闭时 SessionEnd 不会触发，HUD 靠定期检查该 pid
+    是否存活来及时摘掉小球上的点"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+
+        class PROCESSENTRY32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_char * 260),
+            ]
+
+        snap = kernel32.CreateToolhelp32Snapshot(0x2, 0)
+        if snap == -1:
+            return 0, ""
+        ppid: dict = {}
+        names: dict = {}
+        e = PROCESSENTRY32()
+        e.dwSize = ctypes.sizeof(PROCESSENTRY32)
+        if kernel32.Process32First(snap, ctypes.byref(e)):
+            while True:
+                ppid[e.th32ProcessID] = e.th32ParentProcessID
+                names[e.th32ProcessID] = e.szExeFile.decode(errors="replace").lower()
+                if not kernel32.Process32Next(snap, ctypes.byref(e)):
+                    break
+        kernel32.CloseHandle(snap)
+        pid = os.getpid()
+        for _ in range(12):
+            pid = ppid.get(pid, 0)
+            if not pid:
+                break
+            if names.get(pid, "") in ("node.exe", "claude.exe", "bun.exe", "deno.exe"):
+                return pid, names[pid]
+        return 0, ""
+    except Exception:
+        return 0, ""
+
+
+def _foreground_hwnd() -> int:
+    """取当前前台窗口。UserPromptSubmit 时用户刚在该终端敲回车，
+    前台窗口即会话所在终端/IDE——进程父链断裂（PyCharm 等经
+    pty 引导进程拉起 shell）时的最可靠兜底"""
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if hwnd and user32.IsWindowVisible(hwnd) \
+                and user32.GetWindowTextLengthW(hwnd) > 0:
+            return hwnd
+    except Exception:
+        pass
+    return 0
+
+
 # ---------- 主逻辑 ----------
 
 def main() -> None:
@@ -218,7 +280,8 @@ def main() -> None:
             "cwd": cwd,
         }
         # 旧会话补录终端窗口（SessionStart 早于该功能或当时捕获失败）
-        if not _read_state().get(session_id, {}).get("term_hwnd"):
+        state = _read_state().get(session_id, {})
+        if not state.get("term_hwnd"):
             try:
                 hwnd, tpid = _find_terminal_hwnd()
             except Exception:
@@ -226,10 +289,17 @@ def main() -> None:
             if hwnd:
                 data["term_hwnd"] = hwnd
                 data["term_pid"] = tpid
+        if not state.get("cc_pid"):
+            cc_pid, cc_exe = _find_cc_pid()
+            if cc_pid:
+                data["cc_pid"] = cc_pid
+                data["cc_exe"] = cc_exe
         update_session(session_id, data)
         send_msg({"type": "pre_tool", "session_id": session_id,
                   "tool_name": tool_name, "tool_input": tool_input, "cwd": cwd,
-                  "term_hwnd": data.get("term_hwnd", 0)})
+                  "term_hwnd": data.get("term_hwnd", 0),
+                  "cc_pid": data.get("cc_pid", 0),
+                  "cc_exe": data.get("cc_exe", "")})
 
     elif hook_event == "PostToolUse":
         tool_name = event.get("tool_name", "")
@@ -254,14 +324,37 @@ def main() -> None:
             term_hwnd, term_pid = _find_terminal_hwnd()
         except Exception:
             term_hwnd, term_pid = 0, 0
+        if not term_hwnd:
+            # 刚敲 claude 启动，前台窗口即所在终端/IDE
+            term_hwnd, term_pid = _foreground_hwnd(), 0
+        cc_pid, cc_exe = _find_cc_pid()
         update_session(session_id, {"status": "waiting", "cwd": cwd, "tool_name": "",
-                                    "term_hwnd": term_hwnd, "term_pid": term_pid})
+                                    "term_hwnd": term_hwnd, "term_pid": term_pid,
+                                    "cc_pid": cc_pid, "cc_exe": cc_exe})
         send_msg({"type": "session_start", "session_id": session_id, "cwd": cwd,
-                  "term_hwnd": term_hwnd, "term_pid": term_pid})
+                  "term_hwnd": term_hwnd, "term_pid": term_pid,
+                  "cc_pid": cc_pid, "cc_exe": cc_exe})
 
     elif hook_event == "SessionEnd":
         remove_session(session_id)
         send_msg({"type": "session_end", "session_id": session_id})
+
+    elif hook_event == "UserPromptSubmit":
+        # 敲回车瞬间：①补录终端窗口（祖先链找不到用前台窗口兜底）；
+        # ②通知 HUD 学习激活标签（此刻用户正盯着该会话的标签页）
+        hwnd = _read_state().get(session_id, {}).get("term_hwnd", 0)
+        if not hwnd:
+            try:
+                hwnd, tpid = _find_terminal_hwnd()
+            except Exception:
+                hwnd, tpid = 0, 0
+            if not hwnd:
+                hwnd, tpid = _foreground_hwnd(), 0
+            if hwnd:
+                update_session(session_id, {"term_hwnd": hwnd,
+                                            "term_pid": tpid, "cwd": cwd})
+        send_msg({"type": "prompt_submit", "session_id": session_id,
+                  "term_hwnd": hwnd or 0})
 
     elif hook_event == "Notification":
         # 原生确认提示出现（敏感文件/MCP/转终端/空闲等待），转发给 HUD 弹提醒窗

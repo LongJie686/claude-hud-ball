@@ -8,6 +8,7 @@ from __future__ import annotations  # 兼容 Python 3.9
 import sys
 import json
 import math
+import re
 import asyncio
 import threading
 import queue
@@ -27,6 +28,7 @@ _msg_queue: queue.Queue = queue.Queue()
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE      = os.path.join(BASE_DIR, "sessions.json")
 HISTORY_FILE    = os.path.join(BASE_DIR, "history.json")
+CONFIG_FILE     = os.path.join(BASE_DIR, "config.json")
 LOG_DIR         = os.path.join(BASE_DIR, "logs")
 MAX_HISTORY     = 100
 # 恢复 sessions.json 时，超过此时长未更新的会话视为已结束
@@ -48,6 +50,345 @@ def _setup_logger() -> logging.Logger:
 
 
 logger = _setup_logger()
+
+
+def load_config() -> dict:
+    """读 config.json（自动放行模式等开关）。缺失/损坏返回空配置"""
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def save_config(cfg: dict) -> None:
+    """原子写 config.json；permission.py hook 每次触发都会读它"""
+    tmp = CONFIG_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CONFIG_FILE)
+    except Exception:
+        logger.exception("写入 config.json 失败")
+
+
+def session_auto_allow(sid: str) -> bool:
+    """某会话是否开了自动放行（per-session 开关，与全局 auto_allow 独立）"""
+    return bool((load_config().get("auto_allow_sessions") or {}).get(sid, False))
+
+
+def set_session_auto_allow(sid: str, on: bool) -> None:
+    """写/清某会话的自动放行标记；会话结束时用 on=False 清理，防止 config 积垃圾"""
+    cfg = load_config()
+    sess = cfg.get("auto_allow_sessions") or {}
+    if on:
+        sess[sid] = True
+    elif sid in sess:
+        sess.pop(sid)
+    else:
+        return  # 无变化不落盘
+    cfg["auto_allow_sessions"] = sess
+    save_config(cfg)
+
+
+# 标题归一化：只留中英文数字（去掉 CC 标题里的转轮动画字符 ⠐/✳、空格、标点），
+# 这样标题里的转轮帧变化不影响匹配
+_TITLE_WORD_RE = re.compile(r"[\w一-鿿]+")
+
+
+def _norm_title(s: str) -> str:
+    return "".join(_TITLE_WORD_RE.findall(s or "")).lower()
+
+
+def _has_spinner(s: str) -> bool:
+    """标题里是否含转轮动画字符（盲文区 U+2800-28FF）——CC 工作中的标签特征"""
+    return any(0x2800 <= ord(c) <= 0x28FF for c in (s or ""))
+
+
+def _uia_walk_tabs(hwnd: int, on_tab) -> None:
+    """遍历 hwnd 窗口 UIA 树中的标签类控件，对每个调用 on_tab(ctrl)，返回 True 停止。
+
+    Windows Terminal（含 cmd/PowerShell 多标签）：标签是浅层 TabItem，稳定可用；
+    VSCode/JetBrains 等 IDE：控件树深、暴露程度不一，尽力而为。
+    必须在工作线程调用（uiautomation 按线程初始化 COM），不可阻塞 Qt 主线程。
+    """
+    try:
+        import uiautomation as auto
+    except ImportError:
+        logger.warning("uiautomation 未安装，无法枚举标签页")
+        return
+    buf = ctypes.create_unicode_buffer(64)
+    ctypes.windll.user32.GetClassNameW(hwnd, buf, 64)
+    is_wt = buf.value == "CASCADIA_HOSTING_WINDOW_CLASS"
+    # 只认 TabItem：VSCode 把聊天内容渲染成 ListItem，混入会误匹配正文行
+    tab_types = ("TabItemControl",)
+    max_depth = 10 if is_wt else 40
+    deadline = time.time() + (1.0 if is_wt else 2.5)
+    with auto.UIAutomationInitializerInThread():
+        root = auto.ControlFromHandle(hwnd)
+        if not root:
+            return
+        for _attempt in (0, 1):
+            found_tab = False
+            stack = [(root, 0)]
+            visited = 0
+            deadline = time.time() + (1.0 if is_wt else 2.5)
+            while stack:
+                if time.time() > deadline or visited > 5000:
+                    break
+                ctrl, depth = stack.pop()
+                visited += 1
+                try:
+                    if ctrl.ControlTypeName in tab_types:
+                        found_tab = True
+                        if on_tab(ctrl):
+                            return
+                        continue  # 标签节点下不再深入
+                    if depth < max_depth:
+                        stack.extend((c, depth + 1) for c in ctrl.GetChildren())
+                except Exception:
+                    continue
+            if found_tab or is_wt:
+                return
+            # Chromium(VSCode 等)无障碍树按需构建：首扫只是唤醒触发器，
+            # 读到的是空壳(实测 19 节点→唤醒后 931 节点)，等它展开后重扫一遍
+            time.sleep(2.0)
+
+
+def _uia_select_session_tab(hwnd: int, keys: list) -> bool:
+    """在 hwnd 窗口的标签页里匹配 keys 并选中（点击会话点时调用）。
+    先收集全部标签再按键优先级匹配——长键在前（会话标题比目录名更具体），
+    避免短兜底键抢先命中错误标签。"""
+    keys = [k for k in keys if k]
+    if not keys or not hwnd:
+        return False
+    tabs = []
+
+    def on_tab(ctrl):
+        tabs.append((_norm_title(ctrl.Name), ctrl))
+        return False
+
+    try:
+        _uia_walk_tabs(hwnd, on_tab)
+    except Exception:
+        logger.exception("UIA 标签枚举异常")
+        return False
+    for key in sorted(set(keys), key=len, reverse=True):
+        for name, ctrl in tabs:
+            # 双向包含：学到的标题与标签显示可能一边被截断；
+            # 反向包含要求名字至少 4 字，防短名标签误命中
+            if not name or not (key in name or (len(name) >= 4 and name in key)):
+                continue
+            if _activate_tab(ctrl):
+                return True
+    logger.info("标签匹配落空: keys=%s 候选=%s",
+                keys, [n for n, _ in tabs][:10])
+    return False
+
+
+def _tab_is_selected(ctrl) -> bool:
+    try:
+        return bool(ctrl.GetSelectionItemPattern().IsSelected)
+    except Exception:
+        return False
+
+
+def _persist_session_fields(sid: str, fields: dict) -> None:
+    """把学习到的字段写回 sessions.json——term_titles 只在 HUD 内存的话，
+    HUD 一重启学习结果就全丢（实测踩坑）"""
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if sid not in data:
+            return
+        data[sid].update(fields)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, STATE_FILE)
+    except Exception:
+        logger.exception("持久化会话字段失败: %s", sid[:8])
+
+
+def _activate_tab(ctrl) -> bool:
+    """激活一个标签并校验生效。Chromium(VSCode) 自绘标签对
+    SelectionItemPattern.Select 会静默无效（不抛异常也不切换），
+    必须校验 IsSelected，失败逐级升级：Invoke → 无障碍默认动作 → 真实点击"""
+    if _tab_is_selected(ctrl):
+        # VSCode 等多容器界面"组内选中"≠"显示在最前"（各编辑器组各有选中标签），
+        # 已选中也要补一次激活把它带到前台
+        for act in (lambda: ctrl.GetInvokePattern().Invoke(),
+                    lambda: ctrl.Click(simulateMove=False)):
+            try:
+                act()
+                logger.info("标签已选中，补一次前置激活: %s", ctrl.Name)
+                return True
+            except Exception:
+                continue
+        logger.info("标签已是激活态(无法补激活): %s", ctrl.Name)
+        return True
+    try:
+        ctrl.GetSelectionItemPattern().Select()
+        time.sleep(0.15)
+        if _tab_is_selected(ctrl):
+            logger.info("UIA Select 切换标签: %s", ctrl.Name)
+            return True
+    except Exception:
+        pass
+    try:
+        ctrl.GetInvokePattern().Invoke()
+        time.sleep(0.15)
+        if _tab_is_selected(ctrl):
+            logger.info("UIA Invoke 切换标签: %s", ctrl.Name)
+            return True
+    except Exception:
+        pass
+    try:
+        ctrl.GetLegacyIAccessiblePattern().DoDefaultAction()
+        time.sleep(0.15)
+        if _tab_is_selected(ctrl):
+            logger.info("UIA DoDefaultAction 切换标签: %s", ctrl.Name)
+            return True
+    except Exception:
+        pass
+    try:
+        ctrl.Click(simulateMove=False)
+        logger.info("真实点击切换标签: %s", ctrl.Name)
+        return True
+    except Exception:
+        logger.warning("标签激活全部方式失败: %s", ctrl.Name)
+        return False
+
+
+def _learn_selected_tabs(sid: str, hwnd: int) -> None:
+    """UserPromptSubmit 时认领激活标签：用户刚在该会话敲了回车，此刻窗口里
+    处于激活/选中态的标签页就是它的标签。VSCode 的 Claude Code 扩展把会话
+    显示为编辑器标签（无转轮字符，转轮学习法失灵），这条路径 WT/VSCode 通吃。
+    排除活动栏图标(action-item)。须在工作线程调用。"""
+    try:
+        picked = []
+
+        def on_tab(ctrl):
+            try:
+                cls = ctrl.ClassName or ""
+                if "action-item" in cls:
+                    return False
+                try:
+                    selected = bool(ctrl.GetSelectionItemPattern().IsSelected)
+                except Exception:
+                    selected = "active" in cls or "selected" in cls
+                if selected and (ctrl.Name or "").strip():
+                    picked.append(ctrl.Name.strip())
+            except Exception:
+                pass
+            return False
+
+        _uia_walk_tabs(hwnd, on_tab)
+        # 窗口标题通常是「<激活标签> - <应用名>」（VSCode/WT 皆如此），
+        # 取第一段作补充候选——UIA 枚举漏掉时的第二学习源
+        try:
+            buf = ctypes.create_unicode_buffer(256)
+            ctypes.windll.user32.GetWindowTextW(hwnd, buf, 256)
+            first = (buf.value or "").split(" - ")[0].strip()
+            if first and first not in picked:
+                picked.append(first)
+        except Exception:
+            pass
+        if picked and sid in sessions:
+            titles = picked[:4]
+            if sessions[sid].get("term_titles") != titles:
+                sessions[sid]["term_titles"] = titles
+                _persist_session_fields(sid, {"term_titles": titles})
+                logger.info("学习到会话 %s 激活标签: %s", sid[:8], titles)
+    except Exception:
+        logger.exception("学习激活标签失败")
+
+
+def _alive_process_names():
+    """当前全部进程 pid→exe名(小写)。快照失败返回 None（调用方跳过查活）"""
+    try:
+        kernel32 = ctypes.windll.kernel32
+
+        class PROCESSENTRY32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", ctypes.wintypes.DWORD),
+                ("cntUsage", ctypes.wintypes.DWORD),
+                ("th32ProcessID", ctypes.wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", ctypes.wintypes.DWORD),
+                ("cntThreads", ctypes.wintypes.DWORD),
+                ("th32ParentProcessID", ctypes.wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", ctypes.wintypes.DWORD),
+                ("szExeFile", ctypes.c_char * 260),
+            ]
+
+        snap = kernel32.CreateToolhelp32Snapshot(0x2, 0)
+        if snap == -1:
+            return None
+        names = {}
+        e = PROCESSENTRY32()
+        e.dwSize = ctypes.sizeof(PROCESSENTRY32)
+        if kernel32.Process32First(snap, ctypes.byref(e)):
+            while True:
+                names[e.th32ProcessID] = e.szExeFile.decode(errors="replace").lower()
+                if not kernel32.Process32Next(snap, ctypes.byref(e)):
+                    break
+        kernel32.CloseHandle(snap)
+        return names
+    except Exception:
+        logger.exception("进程快照失败")
+        return None
+
+
+_title_learn_inflight: set = set()
+
+
+def _maybe_learn_title(sid: str) -> None:
+    """pre_tool 时择机后台学习该会话的标签标题（20s 节流 + 单飞防并发）"""
+    s = sessions.get(sid) or {}
+    hwnd = int(s.get("term_hwnd") or 0)
+    if not hwnd or sid in _title_learn_inflight:
+        return
+    if time.time() - s.get("title_learn_ts", 0) < 20:
+        return
+    s["title_learn_ts"] = time.time()
+    _title_learn_inflight.add(sid)
+    threading.Thread(target=_learn_session_tab_title,
+                     args=(sid, hwnd), daemon=True).start()
+
+
+def _learn_session_tab_title(sid: str, hwnd: int) -> None:
+    """认领本会话的标签标题：CC 工作中的标签标题带转轮字符（如「⠐ 检查 OpenCut
+    代码库」），而 hook 进程不共享可见控制台、读不到它，只能从 UIA 标签名学。
+    仅当该窗口恰有一个转轮标签、且该窗口 working 会话只有本会话时才认定，
+    避免张冠李戴；标题随会话进展变化，20s 节流下持续刷新。"""
+    try:
+        working = [s2 for s2, s in sessions.items()
+                   if s.get("status") == "working"
+                   and int(s.get("term_hwnd") or 0) == hwnd]
+        if working != [sid]:
+            return
+        names = []
+
+        def on_tab(ctrl):
+            names.append(ctrl.Name or "")
+            return False
+
+        _uia_walk_tabs(hwnd, on_tab)
+        spinners = [n for n in names if _has_spinner(n)]
+        if len(spinners) != 1:
+            return
+        clean = "".join(ch for ch in spinners[0]
+                        if not (0x2800 <= ord(ch) <= 0x28FF)).strip()
+        if clean and sid in sessions and sessions[sid].get("term_title") != clean:
+            sessions[sid]["term_title"] = clean
+            _persist_session_fields(sid, {"term_title": clean})
+            logger.info("学习到会话 %s 标签标题: %s", sid[:8], clean)
+    except Exception:
+        logger.exception("学习标签标题失败")
+    finally:
+        _title_learn_inflight.discard(sid)
 
 
 def _play_sound(name: str):
@@ -251,6 +592,10 @@ def _process_msg(msg: dict):
         })
         if msg.get("term_hwnd"):
             sessions[sid]["term_hwnd"] = int(msg["term_hwnd"])
+        if msg.get("cc_pid"):
+            sessions[sid]["cc_pid"] = int(msg["cc_pid"])
+            sessions[sid]["cc_exe"] = msg.get("cc_exe", "")
+        _maybe_learn_title(sid)
         bus.session_update.emit(sid, dict(sessions[sid]))
 
     elif mtype == "post_tool":
@@ -288,15 +633,33 @@ def _process_msg(msg: dict):
             "status": "waiting", "tool_name": "", "tool_input": {},
             "cwd": msg.get("cwd", ""), "history": [],
             "term_hwnd": int(msg.get("term_hwnd") or 0),
+            "term_title": "",
+            "cc_pid": int(msg.get("cc_pid") or 0),
+            "cc_exe": msg.get("cc_exe", ""),
             "last_update": datetime.now().strftime("%H:%M:%S"),
             "last_update_ts": time.time(),
             "start_ts": time.time(),
         }
         bus.session_update.emit(sid, dict(sessions[sid]))
 
+    elif mtype == "hwnd_update":
+        # UserPromptSubmit 兜底补录的终端窗口（PyCharm 等父链断裂场景）
+        if sid in sessions and msg.get("term_hwnd"):
+            sessions[sid]["term_hwnd"] = int(msg["term_hwnd"])
+
+    elif mtype == "prompt_submit":
+        # 敲回车瞬间：补录 hwnd + 学习激活标签（此刻激活标签=该会话的标签）
+        if sid in sessions:
+            hwnd_ps = int(msg.get("term_hwnd") or 0)
+            if hwnd_ps:
+                sessions[sid]["term_hwnd"] = hwnd_ps
+                threading.Thread(target=_learn_selected_tabs,
+                                 args=(sid, hwnd_ps), daemon=True).start()
+
     elif mtype == "session_end":
         ReminderDialog.dismiss_for(sid)
         sessions.pop(sid, None)
+        set_session_auto_allow(sid, False)
         bus.session_update.emit(sid, {"status": "removed"})
 
     elif mtype == "permission_request":
@@ -796,9 +1159,25 @@ class PermissionDialog(QDialog):
             "color: #6A6A80; font-size: 10px; background: transparent; border: none;")
         keys_hint.setAlignment(Qt.AlignCenter)
 
+        # 「永久允许」规则预览：点之前先知道会往 settings.json 写什么。
+        # 旧版 hook 不带 allow_rule 字段则不显示（避免误报"仅放行本次"）
+        rule_label = None
+        if "allow_rule" in data:
+            rule = (data.get("allow_rule") or "").strip()
+            if rule:
+                text = f"永久允许将写入: {rule if len(rule) <= 160 else rule[:157] + '...'}"
+            else:
+                text = "永久允许: 该命令无法生成规则，仅放行本次"
+            rule_label = QLabel(text)
+            rule_label.setWordWrap(True)
+            rule_label.setStyleSheet(
+                "color: #8F7FFF; font-size: 10px; background: transparent; border: none;")
+
         layout.addLayout(title_row)
         layout.addWidget(info)
         layout.addWidget(detail_box)
+        if rule_label is not None:
+            layout.addWidget(rule_label)
         layout.addLayout(btn_row)
         layout.addWidget(keys_hint)
 
@@ -1376,6 +1755,11 @@ class FloatingBall(QWidget):
         self._drag_pos = None
         self._press_global = None
         self._press_element: str | None = None
+        self._auto_allow = bool(load_config().get("auto_allow", False))
+        # per-session 开关缓存（paintEvent 40ms 刷新，不能每帧读盘）；
+        # 增删只走 _toggle_session_auto_allow / 会话清理路径，与 config.json 同步
+        self._auto_allow_sids: set = set(
+            sid for sid, on in (load_config().get("auto_allow_sessions") or {}).items() if on)
         self._sling: dict | None = None          # 拉弓中: {sid, anchor, color}
         self._flying_hidden: set[str] = set()    # 在外面飞的点（球上画空位圈）
         self._sling_overlay: SlingOverlay | None = None
@@ -1417,19 +1801,55 @@ class FloatingBall(QWidget):
         self._hist_flush_timer.timeout.connect(_flush_history)
         self._hist_flush_timer.start(30_000)
 
+        # config.json 可被 /aa 斜杠命令等外部修改，按 mtime 监视保持球圈/描边同步
+        self._cfg_mtime = self._config_mtime()
+        self._cfg_watch_timer = QTimer(self)
+        self._cfg_watch_timer.timeout.connect(self._reload_config_if_changed)
+        self._cfg_watch_timer.start(2000)
+
         bus.session_update.connect(self._on_session_update)
         bus.permission_request.connect(self._on_permission_request)
         bus.notification.connect(self._on_notification)
         bus.system_warning.connect(self._on_system_warning)
 
+    def _config_mtime(self) -> float:
+        try:
+            return os.path.getmtime(CONFIG_FILE)
+        except OSError:
+            return 0.0
+
+    def _reload_config_if_changed(self):
+        """config.json 被外部（/aa 命令等）改动时，重载全局/会话开关并重绘"""
+        m = self._config_mtime()
+        if m == self._cfg_mtime:
+            return
+        self._cfg_mtime = m
+        cfg = load_config()
+        self._auto_allow = bool(cfg.get("auto_allow", False))
+        self._auto_allow_sids = set(
+            sid for sid, on in (cfg.get("auto_allow_sessions") or {}).items() if on)
+        self.update()
+
     def _cleanup_stale_sessions(self):
         now = time.time()
+        alive = _alive_process_names()
         for sid in list(sessions.keys()):
-            ts = sessions[sid].get("last_update_ts", 0)
+            s = sessions[sid]
+            # CC 进程存活检测：终端标签被直接关闭时 SessionEnd 不触发，
+            # 靠 cc_pid 查活及时摘点（校验 exe 名防 PID 复用误判）
+            cc_pid = int(s.get("cc_pid") or 0)
+            if cc_pid and alive is not None:
+                if alive.get(cc_pid, "") != (s.get("cc_exe") or ""):
+                    logger.info("CC 进程已退出，移除会话: %s", sid[:8])
+                    self._remove_session(sid)
+                    continue
+            ts = s.get("last_update_ts", 0)
             if ts and now - ts > STALE_SESSION_SECONDS:
                 logger.info("清理无更新会话: %s", sid[:8])
                 ReminderDialog.dismiss_for(sid)
                 sessions.pop(sid, None)
+                set_session_auto_allow(sid, False)
+                self._auto_allow_sids.discard(sid)
                 bus.session_update.emit(sid, {"status": "removed"})
 
     def _refresh_size(self):
@@ -1503,7 +1923,11 @@ class FloatingBall(QWidget):
         grad = QLinearGradient(body.topLeft(), body.bottomLeft())
         grad.setColorAt(0.0, QColor(46, 48, 66, 150))
         grad.setColorAt(1.0, QColor(16, 16, 26, 178))
-        painter.setPen(QPen(QColor(255, 255, 255, 52), 1.0))
+        # 自动放行模式：描边变警示红，一眼可辨当前免确认状态
+        if self._auto_allow:
+            painter.setPen(QPen(QColor(255, 80, 60, 220), 1.6))
+        else:
+            painter.setPen(QPen(QColor(255, 255, 255, 52), 1.0))
         painter.setBrush(QBrush(grad))
         painter.drawRoundedRect(body, radius, radius)
         hi = QRectF(body.x() + radius * 0.5, body.y() + 1.8,
@@ -1544,6 +1968,12 @@ class FloatingBall(QWidget):
             painter.setPen(Qt.NoPen)
             painter.setBrush(QBrush(color))
             painter.drawEllipse(x, y, self.BALL_SIZE, self.BALL_SIZE)
+            # 该会话开了自动放行 → 点外画警示红圈
+            if sid in self._auto_allow_sids:
+                painter.setPen(QPen(QColor(255, 80, 60, 230), 1.5))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawEllipse(QRectF(x - 2.0, y - 2.0,
+                                           self.BALL_SIZE + 4.0, self.BALL_SIZE + 4.0))
 
     def _apply_hover(self, element: str):
         """悬浮 Claude 图标显示全部会话，悬浮单个点只显示该会话"""
@@ -1683,8 +2113,9 @@ class FloatingBall(QWidget):
         if user32.IsIconic(hwnd):
             user32.ShowWindow(hwnd, 9)  # SW_RESTORE
         user32.SetForegroundWindow(hwnd)
-        # WT 多标签页共用一个窗口句柄，系统没有"聚焦到指定标签页"的接口，
-        # 只能聚焦到窗口级；提示目录名让用户自己切标签
+        # WT 多标签/IDE 内嵌终端共用一个窗口句柄，窗口级聚焦到不了具体标签页。
+        # 用 hook 抓的标签标题（CC 自设，同目录多会话也不同）走 UIA 精确选中标签；
+        # WT 稳定，VSCode/JetBrains 尽力而为，失败则维持旧行为（提示目录名）
         cwd = sessions.get(sid, {}).get("cwd", "")
         proj = cwd.replace("\\", "/").rstrip("/").split("/")[-1] if cwd else sid[:8]
         same = 0
@@ -1696,15 +2127,30 @@ class FloatingBall(QWidget):
             root2 = r2 if (r2 and user32.IsWindowVisible(r2)) else h2
             if root2 == hwnd:
                 same += 1
+        s = sessions.get(sid, {})
+        titles = list(s.get("term_titles") or [])
+        title = s.get("term_title", "")
+        keys = ([_norm_title(t) for t in titles]
+                + [_norm_title(title), _norm_title(proj)])
+        threading.Thread(target=_uia_select_session_tab,
+                         args=(hwnd, keys), daemon=True).start()
         tip = f"已聚焦终端 · 会话目录: {proj}"
+        show_title = title or (titles[0] if titles else "")
+        if show_title:
+            tip += f"\n标签: {show_title}"
+        else:
+            tip += "\n尚未学到该会话的标签：在该会话里发一条消息后即可精确切换"
         if same > 1:
-            tip += f"\n该窗口有 {same} 个会话标签，请切到对应标签页"
+            # JetBrains(Swing) UIA 树为空切不了标签，只能提示用户手动切
+            tip += f"\n该窗口有 {same} 个会话，自动切换尽力而为"
         QToolTip.showText(QCursor.pos(), tip, self)
 
     def _remove_session(self, sid: str):
         """移除会话点：内存 + sessions.json 同步删除（终端已关，SessionEnd 不会再来）"""
         ReminderDialog.dismiss_for(sid)
         sessions.pop(sid, None)
+        set_session_auto_allow(sid, False)
+        self._auto_allow_sids.discard(sid)
         try:
             with open(STATE_FILE, encoding="utf-8") as f:
                 data = json.load(f)
@@ -1726,14 +2172,57 @@ class FloatingBall(QWidget):
             QMenu::item { padding: 5px 24px; border-radius: 4px; }
             QMenu::item:selected { background: rgba(110,91,255,0.45); }
         """)
+        # 右键落在某个会话点上 → 提供该会话的单独开关（点带红圈提示）
+        elem = self._element_at(event.pos())
+        if elem != "__icon__" and elem in sessions:
+            cwd = sessions[elem].get("cwd", "")
+            proj = cwd.replace("\\", "/").rstrip("/").split("/")[-1] if cwd else elem[:8]
+            act_sess = QAction(f"自动放行 · 本会话（{proj}）", menu)
+            act_sess.setCheckable(True)
+            act_sess.setChecked(elem in self._auto_allow_sids)
+            act_sess.triggered.connect(
+                lambda checked, sid=elem: self._toggle_session_auto_allow(sid, checked))
+            menu.addAction(act_sess)
+        act_auto = QAction("自动放行 · 全局（所有会话）", menu)
+        act_auto.setCheckable(True)
+        act_auto.setChecked(self._auto_allow)
+        act_auto.triggered.connect(self._toggle_auto_allow)
         act_history = QAction("查看历史", menu)
         act_quit = QAction("退出 HUD", menu)
         act_history.triggered.connect(self._show_history)
         act_quit.triggered.connect(QApplication.instance().quit)
+        menu.addAction(act_auto)
         menu.addAction(act_history)
         menu.addSeparator()
         menu.addAction(act_quit)
         menu.exec_(event.globalPos())
+
+    def _toggle_auto_allow(self, checked: bool):
+        """全局开关：写 config.json（permission.py hook 每次触发都读），胶囊描边变红"""
+        self._auto_allow = bool(checked)
+        cfg = load_config()
+        cfg["auto_allow"] = self._auto_allow
+        save_config(cfg)
+        logger.info("自动放行模式(全局): %s", "开" if self._auto_allow else "关")
+        tip = ("自动放行(全局)已开启：所有会话权限请求直接放行（deny 规则仍生效）"
+               if self._auto_allow else "自动放行(全局)已关闭，恢复弹窗确认")
+        QToolTip.showText(self.mapToGlobal(QPoint(0, -34)), tip, self)
+        self.update()
+
+    def _toggle_session_auto_allow(self, sid: str, checked: bool):
+        """单会话开关：只对该会话免确认，对应的点画红圈"""
+        if checked:
+            self._auto_allow_sids.add(sid)
+        else:
+            self._auto_allow_sids.discard(sid)
+        set_session_auto_allow(sid, bool(checked))
+        cwd = sessions.get(sid, {}).get("cwd", "")
+        proj = cwd.replace("\\", "/").rstrip("/").split("/")[-1] if cwd else sid[:8]
+        logger.info("自动放行(会话 %s/%s): %s", sid[:8], proj, "开" if checked else "关")
+        tip = (f"会话「{proj}」自动放行已开启（仅此会话免确认）"
+               if checked else f"会话「{proj}」自动放行已关闭")
+        QToolTip.showText(self.mapToGlobal(QPoint(0, -34)), tip, self)
+        self.update()
 
     def _show_history(self):
         dlg = HistoryDialog(self)
