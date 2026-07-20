@@ -8,7 +8,14 @@ input=$(cat)
 plugin_dir=$(ls -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/claude-hud/claude-hud/*/ 2>/dev/null \
   | awk -F/ '{ print $(NF-1) "\t" $(0) }' \
   | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n | tail -1 | cut -f2-)
-out=$(printf '%s' "$input" | "/d/Adownloads/software/node/node" "${plugin_dir}dist/index.js")
+# 自动探测 node：环境变量 > PATH > 候选路径（跨机通用，本机 /e/Adownloads/nodejs、远端 /d/Adownloads/software/node 均覆盖）
+node_bin="${CLAUDE_HUD_NODE:-$(command -v node 2>/dev/null)}"
+if [ -z "$node_bin" ] || ! [ -x "$node_bin" ]; then
+  for cand in /e/Adownloads/nodejs/node /d/Adownloads/software/node/node "/c/Program Files/nodejs/node" /usr/bin/node; do
+    [ -x "$cand" ] && node_bin="$cand" && break
+  done
+fi
+out=$(printf '%s' "$input" | "$node_bin" "${plugin_dir}dist/index.js")
 
 cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/claude-hud/config.json"
 sid=$(printf '%s' "$input" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
